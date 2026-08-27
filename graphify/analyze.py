@@ -5,6 +5,7 @@ import networkx as nx
 import rustworkx as rx
 
 from graphify.build import edge_data
+from graphify.rx_compat import to_rustworkx
 
 # Builtin/mock names that can appear as annotation-derived nodes in pre-existing
 # graphs. Excluded from god-node ranking so they don't displace real abstractions
@@ -356,7 +357,13 @@ def _cross_community_surprises(
             return []
         if G.number_of_nodes() > 5000:
             return []
-        betweenness = nx.edge_betweenness_centrality(G)
+        rx_graph, index_to_label = to_rustworkx(G)
+        edge_scores = rx.edge_betweenness_centrality(rx_graph)
+        betweenness = {
+            (index_to_label[a], index_to_label[b]): score
+            for edge_idx, score in edge_scores.items()
+            for a, b in [rx_graph.get_edge_endpoints_by_index(edge_idx)]
+        }
         top_edges = sorted(betweenness.items(), key=lambda x: x[1], reverse=True)[:top_n]
         result = []
         for (u, v), score in top_edges:
@@ -458,7 +465,9 @@ def suggest_questions(
     # 2. Bridge nodes (high betweenness) → cross-cutting concern questions
     if G.number_of_edges() > 0:
         k = min(100, G.number_of_nodes()) if G.number_of_nodes() > 1000 else None
-        betweenness = nx.betweenness_centrality(G, k=k, seed=42)
+        rx_graph, index_to_label = to_rustworkx(G)
+        node_scores = rx.betweenness_centrality(rx_graph, k=k, seed=42)
+        betweenness = {index_to_label[idx]: score for idx, score in node_scores.items()}
         # Top bridge nodes that are NOT file-level hubs
         bridges = sorted(
             [(n, s) for n, s in betweenness.items()
