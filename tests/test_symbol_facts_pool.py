@@ -155,3 +155,55 @@ def test_pool_failure_falls_back_without_losing_facts(tmp_path, monkeypatch, cap
     monkeypatch.setattr(R, "_map_facts_parallel", exploding)
     assert _signature(_collect(paths)) == expected
     assert "falling back to serial" in capsys.readouterr().err
+
+
+def test_interrupt_does_not_wait_for_queued_work(tmp_path, monkeypatch):
+    """Ctrl-C must not block until every queued chunk drains.
+
+    `with ProcessPoolExecutor(...)` exits via shutdown(wait=True), which on a
+    large corpus kept the process unresponsive for 12.6s after SIGINT (against
+    0.01s for the serial path). An earlier round of this project reverted a
+    pool partly for breaking Ctrl-C, so this pins the shutdown arguments
+    rather than racing a real timer.
+    """
+    import concurrent.futures as cf
+
+    calls = []
+
+    class RecordingPool:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def map(self, _fn, _items, chunksize=None):
+            raise KeyboardInterrupt
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            calls.append({"wait": wait, "cancel_futures": cancel_futures})
+
+    monkeypatch.setattr(cf, "ProcessPoolExecutor", RecordingPool)
+    paths = _corpus(tmp_path, R._FACTS_PARALLEL_THRESHOLD + 20)
+    with pytest.raises(KeyboardInterrupt):
+        _collect(paths)
+
+    assert calls == [{"wait": False, "cancel_futures": True}], (
+        f"interrupt must cancel queued work and not wait; got {calls}"
+    )
+
+
+def test_clean_completion_still_waits_for_workers(tmp_path, monkeypatch):
+    """The non-interrupt path must still drain normally, or results are lost."""
+    import concurrent.futures as cf
+
+    calls = []
+    real = cf.ProcessPoolExecutor
+
+    class WatchedPool(real):
+        def shutdown(self, wait=True, cancel_futures=False):
+            calls.append({"wait": wait, "cancel_futures": cancel_futures})
+            return super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    monkeypatch.setattr(cf, "ProcessPoolExecutor", WatchedPool)
+    paths = _corpus(tmp_path, R._FACTS_PARALLEL_THRESHOLD + 20)
+    facts = _collect(paths)
+    assert calls and calls[-1]["wait"] is True
+    assert _signature(facts)["uses"] > 0

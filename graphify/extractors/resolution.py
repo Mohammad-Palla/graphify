@@ -1691,6 +1691,11 @@ def _collect_js_facts_one_file(path: Path) -> "tuple[_SymbolResolutionFacts, _Sy
 # incremental `watch` rebuilds never pay for it.
 _FACTS_PARALLEL_THRESHOLD = 200
 
+# Files per work item. Larger amortises IPC; smaller bounds how much queued work
+# has to drain before an interrupt is honoured, and how many files a dead worker
+# takes with it.
+_FACTS_CHUNKSIZE = 8
+
 
 def _merge_symbol_facts(dst: _SymbolResolutionFacts, src: _SymbolResolutionFacts) -> None:
     """Append every fact list of ``src`` onto ``dst``.
@@ -1741,10 +1746,22 @@ def _map_facts_parallel(collect_one, selected: list[Path], workers: int):
     """
     import concurrent.futures
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+    # Not a `with` block: its __exit__ is shutdown(wait=True), which on Ctrl-C
+    # blocks until every already-queued chunk drains. Measured at 12.6s of
+    # unresponsiveness on a 1,500-file corpus against 0.01s for the serial path.
+    # An earlier round of this project reverted a pool partly for breaking
+    # Ctrl-C (see GRAPHIFY_BUILD_PERF.md); interrupting must stay responsive.
+    pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers)
+    interrupted = False
+    try:
         # Executor.map yields in INPUT order — that is what keeps the merged
         # fact lists identical to a serial walk.
-        yield from pool.map(collect_one, selected, chunksize=16)
+        yield from pool.map(collect_one, selected, chunksize=_FACTS_CHUNKSIZE)
+    except BaseException:
+        interrupted = True
+        raise
+    finally:
+        pool.shutdown(wait=not interrupted, cancel_futures=True)
 
 
 def _collect_file_symbol_facts(
