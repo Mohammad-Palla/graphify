@@ -44,14 +44,20 @@ def _rustworkx_leiden(stable: nx.Graph, resolution: float) -> dict[str, int] | N
             return None
         id_to_node[key] = node
 
-    rx_graph = rx.PyGraph()
-    idx_of: dict[str, int] = {}
-    for node in stable.nodes():
-        idx_of[str(node)] = rx_graph.add_node(str(node))
-    for u, v, attrs in stable.edges(data=True):
-        rx_graph.add_edge(idx_of[str(u)], idx_of[str(v)], float(attrs.get("weight", 1.0)))
-
+    # Everything that can fail on malformed input lives inside the try,
+    # including the float() coercion of edge weights: a non-numeric or None
+    # weight raised TypeError/ValueError out of this function before, which
+    # defeats the "degrade, don't crash" contract this docstring promises.
     try:
+        rx_graph = rx.PyGraph()
+        idx_of: dict[str, int] = {}
+        for node in stable.nodes():
+            idx_of[str(node)] = rx_graph.add_node(str(node))
+        for u, v, attrs in stable.edges(data=True):
+            rx_graph.add_edge(
+                idx_of[str(u)], idx_of[str(v)], float(attrs.get("weight", 1.0))
+            )
+
         clusters = rx.graph_leiden(
             rx_graph,
             weight_fn=lambda w: w,
@@ -67,7 +73,16 @@ def _rustworkx_leiden(stable: nx.Graph, resolution: float) -> dict[str, int] | N
             use_modularity=True,
             seed=42,
         )
-    except Exception:
+    except Exception as exc:
+        # Falling through silently would swap the clustering algorithm - and
+        # so the community structure of the whole graph - with nothing in the
+        # output to say it happened. Say so on stderr; the caller still
+        # degrades rather than crashing.
+        print(
+            f"warning: rustworkx Leiden unavailable ({type(exc).__name__}: {exc}); "
+            "falling back to graspologic/Louvain clustering",
+            file=sys.stderr,
+        )
         return None
 
     return {id_to_node[rx_graph[idx]]: cid for idx, cid in clusters.items()}

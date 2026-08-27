@@ -15,10 +15,16 @@ dependencies = [
     "networkx>=3.4",
     # Prototype dependency for the rustworkx-backend migration (see
     # GRAPHIFY_RUSTWORKX_MIGRATION_SCOPE.md in the parent investigation repo).
-    # Currently satisfied by an editable install of Mohammad-Palla/rustworkx
-    # (branch feat/leiden-and-cycle-length-bound) built locally via
-    # `maturin develop --release` — not yet a published/pinned wheel.
-    "rustworkx",
+    #
+    # This MUST point at the fork, not PyPI. Graphify uses three APIs that
+    # upstream rustworkx does not have — graph_leiden(), betweenness
+    # k=/seed=, and simple_cycles(length_bound=) — and a bare "rustworkx"
+    # requirement resolves to upstream and *installs successfully*, then
+    # fails at runtime with bare TypeErrors (and silently degrades
+    # clustering). A direct reference fails loudly at install time instead.
+    # rx_compat._require_fork() enforces the same thing at import time for
+    # environments where the pin was bypassed.
+    "rustworkx @ git+https://github.com/Mohammad-Palla/rustworkx.git@feat/leiden-and-cycle-length-bound",
     "numpy>=1.21",
     "rapidfuzz>=3.0",
     "tree-sitter>=0.23.0,<0.26",
