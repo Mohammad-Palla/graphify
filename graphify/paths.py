@@ -130,6 +130,36 @@ _TEST_FILENAME_PATTERNS = (
 )
 
 
+# Memos for the cross-file call-resolution tie-breakers below. Both are pure
+# functions of a path STRING (no filesystem access), and both are called once
+# per candidate inside `disambiguate_ambiguous_candidates`, which itself fires
+# once per ambiguous raw call. On a corpus with many same-named symbols across
+# packages and tests that is hundreds of thousands of calls over a candidate set
+# bounded by the file count, so nearly every one recomputes a known answer.
+#
+# This is corpus-shape-dependent, not language-dependent: measured at 3.2us per
+# raw call on Django and 245us on Bun with identical code, because Bun's JS/TS
+# monorepo makes names ambiguous far more often.
+#
+# Keyed on the raw string so the result is identical to recomputing. Cleared
+# wholesale if they grow past a sane bound, so a long-lived `graphify watch` or
+# MCP process spanning many corpora cannot retain unbounded path strings.
+_PATH_MEMO_MAX = 200_000
+_TEST_PATH_CACHE: dict[str, bool] = {}
+_PARENT_PARTS_CACHE: dict[str, tuple] = {}
+
+
+def _parent_parts(source_file: str) -> tuple:
+    """Path segments of ``source_file``'s parent directory, memoized."""
+    cached = _PARENT_PARTS_CACHE.get(source_file)
+    if cached is None:
+        cached = PurePosixPath(str(source_file).replace("\\", "/")).parent.parts
+        if len(_PARENT_PARTS_CACHE) >= _PATH_MEMO_MAX:
+            _PARENT_PARTS_CACHE.clear()
+        _PARENT_PARTS_CACHE[source_file] = cached
+    return cached
+
+
 def _is_test_path(path: str) -> bool:
     """Classify a source path as a test path (case-insensitive, segment-aware).
 
@@ -144,6 +174,19 @@ def _is_test_path(path: str) -> bool:
     """
     if not path:
         return False
+    cached = _TEST_PATH_CACHE.get(path)
+    if cached is None:
+        cached = _compute_is_test_path(path)
+        if len(_TEST_PATH_CACHE) >= _PATH_MEMO_MAX:
+            _TEST_PATH_CACHE.clear()
+        _TEST_PATH_CACHE[path] = cached
+    return cached
+
+
+def _compute_is_test_path(path: str) -> bool:
+    """Uncached body of :func:`_is_test_path`. Kept separate so the classifier
+    keeps its several early returns instead of threading a result variable
+    through each one."""
     # Accept both POSIX and Windows separators regardless of host OS so the
     # classifier is stable across the mixed paths that flow through extraction.
     norm = str(path).replace("\\", "/")
@@ -194,8 +237,9 @@ def _path_proximity_winner(call_site_file: str, candidate_files: dict[str, str])
         return None  # genuinely ambiguous within one file; bail
 
     # Tier 2: same directory.
+    call_dir_parts = call_dir.parts
     same_dir = [cid for cid, f in candidate_files.items()
-                if PurePosixPath(str(f).replace("\\", "/")).parent == call_dir]
+                if _parent_parts(f) == call_dir_parts]
     if len(same_dir) == 1:
         return same_dir[0]
     if len(same_dir) > 1:
@@ -206,7 +250,7 @@ def _path_proximity_winner(call_site_file: str, candidate_files: dict[str, str])
     call_parts = call_dir.parts
 
     def _common_prefix_len(f: str) -> int:
-        parts = PurePosixPath(str(f).replace("\\", "/")).parent.parts
+        parts = _parent_parts(f)
         n = 0
         for a, b in zip(call_parts, parts):
             if a != b:
