@@ -13,6 +13,12 @@ keywords = ["claude", "claude-code", "codex", "opencode", "kilo", "cursor", "gem
 requires-python = ">=3.10"
 dependencies = [
     "networkx>=3.4",
+    # Prototype dependency for the rustworkx-backend migration (see
+    # GRAPHIFY_RUSTWORKX_MIGRATION_SCOPE.md in the parent investigation repo).
+    # Currently satisfied by an editable install of Mohammad-Palla/rustworkx
+    # (branch feat/leiden-and-cycle-length-bound) built locally via
+    # `maturin develop --release` — not yet a published/pinned wheel.
+    "rustworkx",
     "numpy>=1.21",
     "rapidfuzz>=3.0",
     "tree-sitter>=0.23.0,<0.26",

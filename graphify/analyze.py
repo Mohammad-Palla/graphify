@@ -2,6 +2,7 @@
 from __future__ import annotations
 from pathlib import Path
 import networkx as nx
+import rustworkx as rx
 
 from graphify.build import edge_data
 
@@ -668,7 +669,18 @@ def find_import_cycles(
 
     # Step 1: Build a directed file-level graph from import/re-export edges.
     # IMPORTANT: resolve endpoints using source_file only; never infer from label/id.
-    file_graph = nx.DiGraph()
+    # Built on rustworkx (index-based) rather than NetworkX (label-based), so a
+    # local file-path -> node-index map stands in for what NetworkX's
+    # label-keyed nodes gave for free.
+    file_graph = rx.PyDiGraph()
+    file_index: dict[str, int] = {}
+
+    def _file_node(label: str) -> int:
+        idx = file_index.get(label)
+        if idx is None:
+            idx = file_graph.add_node(label)
+            file_index[label] = idx
+        return idx
 
     for u, v, data in G.edges(data=True):
         rel = data.get("relation", "")
@@ -702,19 +714,22 @@ def find_import_cycles(
         if not tgt_file:
             continue
 
-        file_graph.add_edge(src_file_attr, tgt_file)
+        src_idx, tgt_idx = _file_node(src_file_attr), _file_node(tgt_file)
+        if not file_graph.has_edge(src_idx, tgt_idx):
+            file_graph.add_edge(src_idx, tgt_idx, None)
 
-    if not file_graph.edges():
+    if file_graph.num_edges() == 0:
         return []
 
     # Step 2: Find simple cycles, bounded by length.
-    # Pass length_bound so networkx prunes during enumeration rather than
-    # enumerating all elementary cycles and post-filtering — avoids exponential
-    # blowup on dense graphs with many long cycles (#1196).
+    # Pass length_bound so the search itself is pruned during enumeration
+    # rather than enumerating all elementary cycles and post-filtering —
+    # avoids exponential blowup on dense graphs with many long cycles (#1196).
     cycles: list[list[str]] = []
-    for cycle in nx.simple_cycles(file_graph, length_bound=max_cycle_length):
-        if len(cycle) <= max_cycle_length:
-            cycles.append(cycle)
+    for cycle in rx.simple_cycles(file_graph, length_bound=max_cycle_length):
+        labeled = [file_graph[idx] for idx in cycle]
+        if len(labeled) <= max_cycle_length:
+            cycles.append(labeled)
         if len(cycles) >= top_n * 10:
             # Stop early to avoid combinatorial explosion
             break
