@@ -1,4 +1,4 @@
-"""Community detection on NetworkX graphs. Uses Leiden (graspologic) if available, falls back to Louvain (networkx). Splits oversized communities. Returns cohesion scores."""
+"""Community detection on NetworkX graphs. Uses Leiden (rustworkx, then graspologic) if available, falls back to Louvain (networkx). Splits oversized communities. Returns cohesion scores."""
 from __future__ import annotations
 import contextlib
 import inspect
@@ -6,6 +6,7 @@ import io
 import json
 import sys
 import networkx as nx
+import rustworkx as rx
 
 
 def _suppress_output():
@@ -19,11 +20,66 @@ def _suppress_output():
     return contextlib.redirect_stdout(io.StringIO())
 
 
+def _rustworkx_leiden(stable: nx.Graph, resolution: float) -> dict[str, int] | None:
+    """Leiden via the rustworkx fork's vendored network_partitions crate.
+
+    Tried first: rustworkx is a hard dependency (unlike graspologic, which
+    is optional), so this is normally the only path that runs at all.
+    Falls through to graspologic or NetworkX Louvain (returns None) on any
+    failure, rather than raising — clustering should degrade, not crash the
+    whole build.
+
+    Graphify's node IDs are guaranteed-unique strings by construction
+    (extract.py's _make_id always returns str; resolution.py's
+    _disambiguate_colliding_node_ids salts any would-be collision before
+    the graph is ever built) — but this still guards against two distinct
+    node objects stringifying identically, rather than trusting that
+    invariant blindly.
+    """
+    id_to_node: dict[str, object] = {}
+    for node in stable.nodes():
+        key = str(node)
+        existing = id_to_node.get(key)
+        if existing is not None and existing != node:
+            return None
+        id_to_node[key] = node
+
+    rx_graph = rx.PyGraph()
+    idx_of: dict[str, int] = {}
+    for node in stable.nodes():
+        idx_of[str(node)] = rx_graph.add_node(str(node))
+    for u, v, attrs in stable.edges(data=True):
+        rx_graph.add_edge(idx_of[str(u)], idx_of[str(v)], float(attrs.get("weight", 1.0)))
+
+    try:
+        clusters = rx.graph_leiden(
+            rx_graph,
+            weight_fn=lambda w: w,
+            resolution=resolution,
+            # Matches graspologic's own leiden() defaults (randomness=0.001,
+            # iterations=1) rather than the vendored crate's own internal
+            # default (randomness=0.01) - confirmed via a real ARI
+            # comparison that the crate's own default produces a
+            # meaningfully different (over-fragmented) partition on real
+            # data. See GRAPHIFY_RUSTWORKX_MIGRATION_SCOPE.md.
+            randomness=0.001,
+            iterations=1,
+            use_modularity=True,
+            seed=42,
+        )
+    except Exception:
+        return None
+
+    return {id_to_node[rx_graph[idx]]: cid for idx, cid in clusters.items()}
+
+
 def _partition(G: nx.Graph, resolution: float = 1.0) -> dict[str, int]:
     """Run community detection. Returns {node_id: community_id}.
 
-    Tries Leiden (graspologic) first — best quality.
-    Falls back to Louvain (built into networkx) if graspologic is not installed.
+    Tries Leiden (rustworkx) first — best quality, and always available
+    since rustworkx is a hard dependency. Falls back to Leiden (graspologic)
+    if that somehow fails, then to Louvain (built into networkx) if
+    graspologic is not installed either.
 
     resolution > 1.0 → more, smaller communities.
     resolution < 1.0 → fewer, larger communities.
@@ -43,6 +99,10 @@ def _partition(G: nx.Graph, resolution: float = 1.0) -> dict[str, int]:
     )
     for src, tgt, attrs in edge_rows:
         stable.add_edge(src, tgt, **attrs)
+
+    rx_result = _rustworkx_leiden(stable, resolution)
+    if rx_result is not None:
+        return rx_result
 
     try:
         from graspologic.partition import leiden
