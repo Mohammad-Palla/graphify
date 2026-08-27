@@ -1408,6 +1408,7 @@ def dispatch_command(cmd: str) -> None:
         from graphify.serve import _pick_scored_endpoint, _score_nodes
         from networkx.readwrite import json_graph
         import networkx as _nx
+        from graphify.rx_compat import deterministic_shortest_path
 
         source_label = sys.argv[2]
         target_label = sys.argv[3]
@@ -1493,25 +1494,15 @@ def dispatch_command(cmd: str) -> None:
                     )
         # Deterministic shortest path (#2074): hash-seeded neighbor views
         # returned an arbitrary route among equal-length paths that varied per
-        # process. Build a sorted, materialized graph so neighbor order — and
-        # thus the chosen path — is canonical for a given graph.json.
+        # process. deterministic_shortest_path builds a sorted, materialized
+        # graph so neighbor order — and thus the chosen path — is canonical
+        # for a given graph.json. Directed by default (#2487): true direction
+        # is NOT raw arc order; legacy canonicalized files persist a flipped
+        # arc with _src/_tgt markers (#2309), which the helper corrects for.
         try:
-            if undirected:
-                _und = _nx.Graph()
-                _und.add_nodes_from(sorted(G.nodes))
-                _und.add_edges_from(sorted((min(u, v), max(u, v)) for u, v in G.edges()))
-                path_nodes = _nx.shortest_path(_und, src_nid, tgt_nid)
-            else:
-                # Directed by default (#2487). True direction is NOT raw arc
-                # order: legacy canonicalized files persist a flipped arc with
-                # _src/_tgt markers (#2309), so build the digraph from _src/_tgt
-                # (falling back to the loaded arc) rather than to_directed().
-                _dg = _nx.DiGraph()
-                _dg.add_nodes_from(sorted(G.nodes))
-                _dg.add_edges_from(sorted(
-                    (d.get("_src", u), d.get("_tgt", v)) for u, v, d in G.edges(data=True)
-                ))
-                path_nodes = _nx.shortest_path(_dg, src_nid, tgt_nid)
+            path_nodes = deterministic_shortest_path(
+                G, src_nid, tgt_nid, undirected=undirected
+            )
         except (_nx.NetworkXNoPath, _nx.NodeNotFound):
             if undirected:
                 print(f"No path found between '{source_label}' and '{target_label}'.")

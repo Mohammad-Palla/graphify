@@ -13,6 +13,7 @@ from typing import NamedTuple
 import networkx as nx
 from networkx.readwrite import json_graph
 from graphify.security import sanitize_label, check_graph_file_size_cap
+from graphify.rx_compat import deterministic_shortest_path
 from graphify.build import edge_data, edge_datas
 from graphify.paths import default_graph_json as _default_graph_json
 
@@ -1403,25 +1404,13 @@ def _shortest_path_text(G: nx.Graph, arguments: dict) -> str:
     undirected = bool(arguments.get("undirected", False))
     try:
         # Deterministic path (#2074): the hash-seeded undirected view picked an
-        # arbitrary route among equal-length paths. Build a sorted, materialized
-        # graph so the chosen path is canonical. Serve's shared G is left
-        # untouched (its degree feeds query-seed tie-breaks).
-        if undirected:
-            _und = nx.Graph()
-            _und.add_nodes_from(sorted(G.nodes))
-            _und.add_edges_from(sorted((min(u, v), max(u, v)) for u, v in G.edges()))
-            path_nodes = nx.shortest_path(_und, src_nid, tgt_nid)
-        else:
-            # Directed by default (#2487). True direction is NOT raw arc
-            # order: legacy canonicalized files persist a flipped arc with
-            # _src/_tgt markers (#2309), so build the digraph from _src/_tgt
-            # (falling back to the loaded arc) rather than to_directed().
-            _dg = nx.DiGraph()
-            _dg.add_nodes_from(sorted(G.nodes))
-            _dg.add_edges_from(sorted(
-                (d.get("_src", u), d.get("_tgt", v)) for u, v, d in G.edges(data=True)
-            ))
-            path_nodes = nx.shortest_path(_dg, src_nid, tgt_nid)
+        # arbitrary route among equal-length paths. deterministic_shortest_path
+        # builds a sorted, materialized graph so the chosen path is canonical.
+        # Serve's shared G is left untouched (its degree feeds query-seed
+        # tie-breaks). Directed by default (#2487); true direction is NOT raw
+        # arc order — legacy canonicalized files persist a flipped arc with
+        # _src/_tgt markers (#2309), which the helper corrects for.
+        path_nodes = deterministic_shortest_path(G, src_nid, tgt_nid, undirected=undirected)
     except (nx.NetworkXNoPath, nx.NodeNotFound):
         src_label = G.nodes[src_nid].get("label", src_nid)
         tgt_label = G.nodes[tgt_nid].get("label", tgt_nid)
