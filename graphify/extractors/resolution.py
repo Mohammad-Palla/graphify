@@ -10,6 +10,8 @@ from graphify.extractors.base import (  # noqa: F401
     _make_id,
     _read_text,
 )
+import dataclasses
+import functools
 import hashlib
 import json
 import os
@@ -1493,33 +1495,36 @@ def _ts_walk_class_members(class_node, source: bytes, path: Path, class_nid: str
                     _SymbolUseFact(path, class_nid, name, "references", ctx, m_line)
                 )
 
-def _collect_js_symbol_resolution_facts(paths: list[Path], facts: _SymbolResolutionFacts) -> None:
-    js_paths = [
-        path for path in paths
-        if path.suffix in _JS_CACHE_BYPASS_SUFFIXES
-    ]
-    if not js_paths:
-        return
+def _collect_js_facts_one_file(path: Path) -> "tuple[_SymbolResolutionFacts, _SymbolResolutionFacts]":
+    """Collect one JS/TS file's symbol-resolution facts.
 
-    trees: dict[Path, tuple[bytes, object]] = {}
+    Module level and self-contained so it can be dispatched to a
+    ProcessPoolExecutor. Returns ``(facts, class_member_uses)`` with the two
+    ``uses`` producers kept apart — see _collect_js_symbol_resolution_facts for
+    why that separation is what preserves ordering.
+    """
+    facts = _SymbolResolutionFacts()
+    class_member_facts = _SymbolResolutionFacts()
 
-    for path in js_paths:
-        resolved_path = path.resolve()
-        parsed = _parse_js_tree(path)
-        if parsed is None:
-            continue
-        source, root_node = parsed
-        trees[resolved_path] = parsed
+    parsed = _parse_js_tree(path)
+    if parsed is None:
+        return facts, class_member_facts
+    source, root_node = parsed
+    stem = _file_stem(path)
 
-        for node in _walk_js_tree(root_node):
-            if node.type == "export_statement":
-                for name in _js_exported_declaration_names(node, source):
-                    facts.declarations.append(
-                        _SymbolDeclarationFact(path, name, node.start_point[0] + 1)
-                    )
+    for node in _walk_js_tree(root_node):
+        node_type = node.type
+        line = node.start_point[0] + 1
 
-            if node.type != "import_statement":
-                continue
+        # Any node type can introduce a lexical alias, so this stays
+        # unconditional and FIRST — the branches below use `continue` for
+        # control flow and would otherwise skip it.
+        for alias, target in _js_lexical_aliases(node, source):
+            facts.aliases.append(
+                _SymbolAliasFact(path, alias, target, line)
+            )
+
+        if node_type == "import_statement":
             raw_module = _js_module_specifier(node, source)
             if raw_module is None:
                 continue
@@ -1534,7 +1539,7 @@ def _collect_js_symbol_resolution_facts(paths: list[Path], facts: _SymbolResolut
                         local_name,
                         target_path,
                         imported_name,
-                        node.start_point[0] + 1,
+                        line,
                     )
                 )
             default_local = _js_default_import_name(node, source)
@@ -1545,27 +1550,19 @@ def _collect_js_symbol_resolution_facts(paths: list[Path], facts: _SymbolResolut
                         default_local,
                         target_path,
                         "default",
-                        node.start_point[0] + 1,
+                        line,
                     )
                 )
+            continue
 
-        for node in _walk_js_tree(root_node):
-            for alias, target in _js_lexical_aliases(node, source):
-                facts.aliases.append(
-                    _SymbolAliasFact(path, alias, target, node.start_point[0] + 1)
+        if node_type == "export_statement":
+            # The declaration names this export introduces.
+            for name in _js_exported_declaration_names(node, source):
+                facts.declarations.append(
+                    _SymbolDeclarationFact(path, name, line)
                 )
 
-    for path in js_paths:
-        resolved_path = path.resolve()
-        parsed = trees.get(resolved_path)
-        if parsed is None:
-            continue
-        source, root_node = parsed
-
-        for node in _walk_js_tree(root_node):
-            if node.type != "export_statement":
-                continue
-
+            # The export edge itself.
             raw_module = _js_module_specifier(node, source)
             export_clause = _js_export_clause(node)
             if raw_module is not None:
@@ -1580,12 +1577,12 @@ def _collect_js_symbol_resolution_facts(paths: list[Path], facts: _SymbolResolut
                             path,
                             namespace_name,
                             target_path,
-                            node.start_point[0] + 1,
+                            line,
                         )
                     )
                 elif _js_export_statement_is_star(node):
                     facts.star_exports.append(
-                        _StarExportFact(path, target_path, node.start_point[0] + 1)
+                        _StarExportFact(path, target_path, line)
                     )
                 if export_clause is not None:
                     for original_name, exported_name in _js_named_specifiers(
@@ -1595,7 +1592,7 @@ def _collect_js_symbol_resolution_facts(paths: list[Path], facts: _SymbolResolut
                             _SymbolExportFact(
                                 path,
                                 exported_name,
-                                node.start_point[0] + 1,
+                                line,
                                 target_path=target_path,
                                 target_name=original_name,
                             )
@@ -1610,7 +1607,7 @@ def _collect_js_symbol_resolution_facts(paths: list[Path], facts: _SymbolResolut
                         _SymbolExportFact(
                             path,
                             exported_name,
-                            node.start_point[0] + 1,
+                            line,
                             local_name=local_name,
                         )
                     )
@@ -1621,7 +1618,7 @@ def _collect_js_symbol_resolution_facts(paths: list[Path], facts: _SymbolResolut
                     _SymbolExportFact(
                         path,
                         exported_name,
-                        node.start_point[0] + 1,
+                        line,
                         local_name=exported_name,
                     )
                 )
@@ -1636,47 +1633,17 @@ def _collect_js_symbol_resolution_facts(paths: list[Path], facts: _SymbolResolut
                     _SymbolExportFact(
                         path,
                         "default",
-                        node.start_point[0] + 1,
+                        line,
                         local_name=default_name,
                     )
                 )
-
-    for path in js_paths:
-        resolved_path = path.resolve()
-        parsed = trees.get(resolved_path)
-        if parsed is None:
             continue
-        source, root_node = parsed
-        for source_id, body in _js_top_level_function_bodies(path, root_node, source):
-            for node in _walk_js_tree(body):
-                imported_name = _js_call_identifier(node, source)
-                if imported_name is None:
-                    continue
-                facts.uses.append(
-                    _SymbolUseFact(
-                        path,
-                        source_id,
-                        imported_name,
-                        "calls",
-                        "call",
-                        node.start_point[0] + 1,
-                    )
-                )
 
-    for path in js_paths:
-        resolved_path = path.resolve()
-        parsed = trees.get(resolved_path)
-        if parsed is None:
-            continue
-        source, root_node = parsed
-        stem = _file_stem(path)
-        for node in _walk_js_tree(root_node):
-            if node.type not in (
-                "class_declaration",
-                "abstract_class_declaration",
-                "interface_declaration",
-            ):
-                continue
+        if node_type in (
+            "class_declaration",
+            "abstract_class_declaration",
+            "interface_declaration",
+        ):
             name_node = node.child_by_field_name("name")
             if name_node is None:
                 continue
@@ -1684,7 +1651,147 @@ def _collect_js_symbol_resolution_facts(paths: list[Path], facts: _SymbolResolut
             if not class_name:
                 continue
             class_nid = _make_id(stem, class_name)
-            _ts_walk_class_members(node, source, path, class_nid, facts)
+            _ts_walk_class_members(node, source, path, class_nid, class_member_facts)
+
+    # Call sites inside top-level function bodies.
+    for source_id, body in _js_top_level_function_bodies(path, root_node, source):
+        for node in _walk_js_tree(body):
+            imported_name = _js_call_identifier(node, source)
+            if imported_name is None:
+                continue
+            facts.uses.append(
+                _SymbolUseFact(
+                    path,
+                    source_id,
+                    imported_name,
+                    "calls",
+                    "call",
+                    node.start_point[0] + 1,
+                )
+            )
+
+
+    return facts, class_member_facts
+
+
+# Below this many JS/TS files the pool costs more (process spawn + module
+# re-import) than the serial walk it replaces.
+# ── Per-file symbol-fact collection ───────────────────────────────────────────
+#
+# Every language's collector has the same shape: filter the corpus to the
+# suffixes it owns, parse each file, walk the tree, append facts. That work is
+# pure and strictly per-file — no cross-file state — but each collector used to
+# run it serially in the parent AFTER the extraction pool had already exited,
+# leaving the other cores idle. Each also kept every parsed tree alive in a
+# `trees` dict so a second pass could find it again.
+#
+# One driver, one adapter per language: a new language writes a `_collect_*_
+# facts_one_file` and gets the pooling, the ordering guarantees and the
+# threshold for free, instead of copying the pattern a third time.
+
+# Below this many files of a given language the pool costs more (process spawn
+# plus module re-import) than the serial walk it replaces, so small repos and
+# incremental `watch` rebuilds never pay for it.
+_FACTS_PARALLEL_THRESHOLD = 200
+
+
+def _merge_symbol_facts(dst: _SymbolResolutionFacts, src: _SymbolResolutionFacts) -> None:
+    """Append every fact list of ``src`` onto ``dst``.
+
+    Driven off ``dataclasses.fields`` rather than a hand-written field list: a
+    fact list added to _SymbolResolutionFacts later is merged automatically
+    instead of being silently dropped here.
+    """
+    for spec in dataclasses.fields(_SymbolResolutionFacts):
+        getattr(dst, spec.name).extend(getattr(src, spec.name))
+
+
+def _map_facts_parallel(collect_one, selected: list[Path]) -> "list | None":
+    """Run ``collect_one`` over ``selected`` across processes, in input order.
+
+    Returns None on any failure — a single-worker pool (pure overhead), a
+    broken pool, an unpicklable payload — so the caller falls back to the
+    serial path rather than losing facts.
+    """
+    import concurrent.futures
+
+    env_raw = os.environ.get("GRAPHIFY_MAX_WORKERS", "").strip()
+    cpu_cap = None
+    if env_raw:
+        try:
+            value = int(env_raw)
+            if value > 0:
+                cpu_cap = value
+        except ValueError:
+            pass
+    if cpu_cap is None:
+        cpu_cap = os.cpu_count() or 4
+    max_workers = max(1, min(cpu_cap, len(selected)))
+    if sys.platform == "win32":
+        # Same CPython WaitForMultipleObjects ceiling extract() clamps to.
+        max_workers = min(max_workers, 61)
+    if max_workers == 1:
+        return None
+
+    try:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as pool:
+            # Executor.map yields in INPUT order — that is what keeps the
+            # merged fact lists identical to a serial walk.
+            return list(pool.map(collect_one, selected, chunksize=16))
+    except Exception:
+        return None
+
+
+def _collect_file_symbol_facts(
+    paths: list[Path],
+    facts: _SymbolResolutionFacts,
+    *,
+    select,
+    collect_one,
+) -> None:
+    """Collect one language's per-file symbol facts into ``facts``.
+
+    ``select(path)`` picks the files this language owns; it stays in the parent
+    so it may be a lambda. ``collect_one(path)`` must be module level (or a
+    functools.partial of one) so it can be pickled to a worker, and returns
+    ``(facts, deferred)``.
+
+    Ordering is preserved exactly, which is the whole correctness argument:
+
+      - results merge in input order, so every fact list stays file-major and
+        matches what the serial walk produced.
+      - ``deferred`` exists because a language can have TWO producers for the
+        same list with a global ordering between them — JS appends every file's
+        top-level-function-body ``uses`` before ANY file's class-member
+        ``uses``. Those facts go in the second bucket and are appended once
+        every file has merged, instead of interleaving per file. A language
+        without that constraint returns an empty bucket.
+    """
+    selected = [path for path in paths if select(path)]
+    if not selected:
+        return
+
+    results = None
+    if len(selected) >= _FACTS_PARALLEL_THRESHOLD:
+        results = _map_facts_parallel(collect_one, selected)
+    if results is None:
+        results = (collect_one(path) for path in selected)
+
+    deferred_all = _SymbolResolutionFacts()
+    for file_facts, deferred in results:
+        _merge_symbol_facts(facts, file_facts)
+        _merge_symbol_facts(deferred_all, deferred)
+    _merge_symbol_facts(facts, deferred_all)
+
+
+def _collect_js_symbol_resolution_facts(paths: list[Path], facts: _SymbolResolutionFacts) -> None:
+    _collect_file_symbol_facts(
+        paths,
+        facts,
+        select=lambda path: path.suffix in _JS_CACHE_BYPASS_SUFFIXES,
+        collect_one=_collect_js_facts_one_file,
+    )
+
 
 def _parse_python_tree(path: Path):
     try:
@@ -1819,81 +1926,101 @@ def _python_call_identifier(node, source: bytes) -> str | None:
         return _read_text(function_node, source)
     return None
 
+def _collect_python_facts_one_file(
+    path: Path, root: Path
+) -> "tuple[_SymbolResolutionFacts, _SymbolResolutionFacts]":
+    """Collect one Python file's symbol-resolution facts.
+
+    Module level so ``functools.partial(_collect_python_facts_one_file,
+    root=root)`` can be pickled to a worker. Python has a single ``uses``
+    producer, so the deferred bucket is always empty — see
+    _collect_file_symbol_facts for what it is for.
+    """
+    facts = _SymbolResolutionFacts()
+    deferred = _SymbolResolutionFacts()
+
+    parsed = _parse_python_tree(path)
+    if parsed is None:
+        return facts, deferred
+    source, root_node = parsed
+
+    for node in _walk_python_tree(root_node):
+        if node.type != "import_from_statement":
+            continue
+        module = _python_import_from_module(node, source)
+        if module is None:
+            continue
+        level, module_name = module
+        target_path = _resolve_python_module_path(module_name, path, root, level)
+        if target_path is None:
+            continue
+        # #1146: `from pkg import submod` — if the target is a package
+        # (__init__.py) and an imported name matches a submodule file on
+        # disk, emit a file-level import edge to that submodule rather
+        # than only to the package.
+        pkg_dir = target_path.parent if target_path.name == "__init__.py" else None
+        for imported_name, local_name in _python_imported_names(node, source):
+            line = node.start_point[0] + 1
+            if pkg_dir is not None:
+                sub_py = pkg_dir / f"{imported_name}.py"
+                sub_pkg = pkg_dir / imported_name / "__init__.py"
+                submodule = sub_py if sub_py.is_file() else (sub_pkg if sub_pkg.is_file() else None)
+                if submodule is not None:
+                    facts.module_imports.append((path, submodule, line, local_name))
+                    continue
+            facts.imports.append(
+                _SymbolImportFact(path, local_name, target_path, imported_name, line)
+            )
+            if path.name == "__init__.py":
+                facts.exports.append(
+                    _SymbolExportFact(
+                        path,
+                        local_name,
+                        line,
+                        target_path=target_path,
+                        target_name=imported_name,
+                    )
+                )
+
+    # Was a second `for path in py_paths` pass that re-fetched this file's tree
+    # from a corpus-wide `trees` dict; it only ever writes `uses`, which pass 1
+    # never touches, so folding it in here cannot reorder anything.
+    for source_id, body in _python_top_level_function_bodies(path, root_node, source):
+        for node in _walk_python_tree(body):
+            imported_name = _python_call_identifier(node, source)
+            if imported_name is None:
+                continue
+            facts.uses.append(
+                _SymbolUseFact(
+                    path,
+                    source_id,
+                    imported_name,
+                    "calls",
+                    "call",
+                    node.start_point[0] + 1,
+                )
+            )
+
+    return facts, deferred
+
+
 def _collect_python_symbol_resolution_facts(
     paths: list[Path],
     root: Path,
     facts: _SymbolResolutionFacts,
 ) -> None:
-    py_paths = [path for path in paths if path.suffix == ".py"]
-    if not py_paths:
-        return
+    _collect_file_symbol_facts(
+        paths,
+        facts,
+        select=lambda path: path.suffix == ".py",
+        collect_one=functools.partial(_collect_python_facts_one_file, root=root),
+    )
 
-    trees: dict[Path, tuple[bytes, object]] = {}
-    for path in py_paths:
-        parsed = _parse_python_tree(path)
-        if parsed is None:
-            continue
-        source, root_node = parsed
-        trees[path.resolve()] = parsed
 
-        for node in _walk_python_tree(root_node):
-            if node.type != "import_from_statement":
-                continue
-            module = _python_import_from_module(node, source)
-            if module is None:
-                continue
-            level, module_name = module
-            target_path = _resolve_python_module_path(module_name, path, root, level)
-            if target_path is None:
-                continue
-            # #1146: `from pkg import submod` — if the target is a package
-            # (__init__.py) and an imported name matches a submodule file on
-            # disk, emit a file-level import edge to that submodule rather
-            # than only to the package.
-            pkg_dir = target_path.parent if target_path.name == "__init__.py" else None
-            for imported_name, local_name in _python_imported_names(node, source):
-                line = node.start_point[0] + 1
-                if pkg_dir is not None:
-                    sub_py = pkg_dir / f"{imported_name}.py"
-                    sub_pkg = pkg_dir / imported_name / "__init__.py"
-                    submodule = sub_py if sub_py.is_file() else (sub_pkg if sub_pkg.is_file() else None)
-                    if submodule is not None:
-                        facts.module_imports.append((path, submodule, line, local_name))
-                        continue
-                facts.imports.append(
-                    _SymbolImportFact(path, local_name, target_path, imported_name, line)
-                )
-                if path.name == "__init__.py":
-                    facts.exports.append(
-                        _SymbolExportFact(
-                            path,
-                            local_name,
-                            line,
-                            target_path=target_path,
-                            target_name=imported_name,
-                        )
-                    )
+# Same diagnostic switch as graphify.extract's; read here rather than imported
+# to keep this module free of a back-dependency on extract.
+_AUGMENT_PROFILE = os.environ.get("GRAPHIFY_EXTRACT_PROFILE") == "1"
 
-    for path in py_paths:
-        parsed = trees.get(path.resolve())
-        if parsed is None:
-            continue
-        source, root_node = parsed
-        for source_id, body in _python_top_level_function_bodies(path, root_node, source):
-            for node in _walk_python_tree(body):
-                imported_name = _python_call_identifier(node, source)
-                if imported_name is None:
-                    continue
-                facts.uses.append(
-                    _SymbolUseFact(
-                        path,
-                        source_id,
-                        imported_name,
-                        "calls",
-                        "call",
-                        node.start_point[0] + 1,
-                    )
-                )
 
 def _augment_symbol_resolution_edges(
     paths: list[Path],
@@ -1902,9 +2029,28 @@ def _augment_symbol_resolution_edges(
     root: Path,
 ) -> None:
     facts = _SymbolResolutionFacts()
+    if not _AUGMENT_PROFILE:
+        _collect_js_symbol_resolution_facts(paths, facts)
+        _collect_python_symbol_resolution_facts(paths, root, facts)
+        _apply_symbol_resolution_facts(paths, nodes, edges, root, facts)
+        return
+
+    import time as _time
+    _t = _time.perf_counter()
     _collect_js_symbol_resolution_facts(paths, facts)
+    _js = _time.perf_counter() - _t
+    _t = _time.perf_counter()
     _collect_python_symbol_resolution_facts(paths, root, facts)
+    _py = _time.perf_counter() - _t
+    _t = _time.perf_counter()
     _apply_symbol_resolution_facts(paths, nodes, edges, root, facts)
+    _apply = _time.perf_counter() - _t
+    for _label, _v in (("collect_js", _js), ("collect_python", _py), ("apply", _apply)):
+        print(f"[graphify extract-profile] augment.{_label}: {_v:.1f}s", flush=True)
+    print(f"[graphify extract-profile] augment.facts: "
+          f"decl={len(facts.declarations)} imp={len(facts.imports)} "
+          f"alias={len(facts.aliases)} exp={len(facts.exports)} uses={len(facts.uses)}",
+          flush=True)
 
 def _resolve_cross_file_imports(
     per_file: list[dict],
