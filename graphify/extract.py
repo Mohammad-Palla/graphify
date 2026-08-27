@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import textwrap
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
@@ -165,6 +166,67 @@ _RECURSION_LIMIT = 10_000
 def _raise_recursion_limit() -> None:
     if sys.getrecursionlimit() < _RECURSION_LIMIT:
         sys.setrecursionlimit(_RECURSION_LIMIT)
+
+
+# ── Phase-0 extraction profiling (GRAPHIFY_EXTRACT_PROFILE=1) ─────────────────
+# Diagnostic only: attributes the `AST extract` stage to its sub-phases so an
+# optimization targets the component that actually dominates. Off by default and
+# zero-cost when off (one module-level bool test per call site).
+_EXTRACT_PROFILE = os.environ.get("GRAPHIFY_EXTRACT_PROFILE") == "1"
+
+
+def _prof_print(label: str, value: str) -> None:
+    print(f"[graphify extract-profile] {label}: {value}", flush=True)
+
+
+class _MarkTimer:
+    """Cumulative sub-stage timer: ``mark(label)`` records elapsed since the last
+    mark, ``report()`` prints the rows biggest-first with their share.
+
+    Used to attribute the serial post-extraction tail, which the single
+    ``AST extract`` stage number hides entirely.
+    """
+
+    __slots__ = ("enabled", "rows", "_t")
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self.rows: list[tuple[str, float]] = []
+        self._t = time.perf_counter() if enabled else 0.0
+
+    def mark(self, label: str) -> None:
+        if not self.enabled:
+            return
+        now = time.perf_counter()
+        self.rows.append((label, now - self._t))
+        self._t = now
+
+    def report(self, prefix: str) -> None:
+        if not self.enabled or not self.rows:
+            return
+        total = sum(v for _, v in self.rows)
+        for label, v in sorted(self.rows, key=lambda kv: -kv[1]):
+            if v < 0.05:
+                continue
+            _prof_print(f"{prefix}.{label}", f"{v:.1f}s ({v / max(total, 1e-9) * 100:.0f}%)")
+        _prof_print(f"{prefix}.SUM", f"{total:.1f}s")
+
+
+def _cpu_times() -> tuple[float, float]:
+    """(self CPU seconds, children CPU seconds) — user+sys.
+
+    Children CPU is what the worker pool actually burned; self CPU includes the
+    executor's queue-management thread, which is where result UNPICKLING happens
+    (not in ``future.result()``), so it is the only way to see that cost.
+    Returns (0.0, 0.0) where ``resource`` is unavailable (Windows).
+    """
+    try:
+        import resource
+    except ImportError:
+        return (0.0, 0.0)
+    me = resource.getrusage(resource.RUSAGE_SELF)
+    kids = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return (me.ru_utime + me.ru_stime, kids.ru_utime + kids.ru_stime)
 
 
 def _safe_extract(extractor: Callable, path: Path) -> dict:
@@ -5469,25 +5531,59 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     _raise_recursion_limit()
     bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
 
-    # Check cache first (avoid re-extraction)
+    if not _EXTRACT_PROFILE:
+        # Check cache first (avoid re-extraction)
+        if not bypass_cache:
+            cached = load_cached(path, root, cache_root=cache_location)
+            if cached is not None:
+                return idx, cached
+
+        extractor = _get_extractor(path)
+        if extractor is None:
+            return idx, {"nodes": [], "edges": []}
+
+        result = _safe_extract_with_xaml_root(extractor, path, root)
+        # Never cache a zero-node result for an extractable file. Every supported
+        # source produces at least a file node, so an empty node list is anomalous
+        # (e.g. a transient batch/parallel hiccup). Caching it makes the empty
+        # byte-stable across runs and silently blinds affected/explain to and
+        # through the file (#1666); skipping the write lets a rerun self-heal.
+        if not bypass_cache and "error" not in result and result.get("nodes"):
+            save_cached(path, result, root, cache_root=cache_location)
+        return idx, result
+
+    # ── profiled path (GRAPHIFY_EXTRACT_PROFILE=1) ───────────────────────────
+    # Same control flow, timed per segment. `t` is returned as a THIRD tuple
+    # element so the parent can sum it; it never enters `result`, which is what
+    # gets cached and merged.
+    _pc = time.perf_counter
+    t = {"cache_probe": 0.0, "dispatch": 0.0, "extract": 0.0, "cache_write": 0.0,
+         "files": 1.0, "bytes": 0.0}
+    try:
+        t["bytes"] = float(path.stat().st_size)
+    except OSError:
+        pass
     if not bypass_cache:
+        _t0 = _pc()
         cached = load_cached(path, root, cache_root=cache_location)
+        t["cache_probe"] = _pc() - _t0
         if cached is not None:
-            return idx, cached
+            return idx, cached, t
 
+    _t0 = _pc()
     extractor = _get_extractor(path)
+    t["dispatch"] = _pc() - _t0
     if extractor is None:
-        return idx, {"nodes": [], "edges": []}
+        return idx, {"nodes": [], "edges": []}, t
 
+    _t0 = _pc()
     result = _safe_extract_with_xaml_root(extractor, path, root)
-    # Never cache a zero-node result for an extractable file. Every supported
-    # source produces at least a file node, so an empty node list is anomalous
-    # (e.g. a transient batch/parallel hiccup). Caching it makes the empty
-    # byte-stable across runs and silently blinds affected/explain to and
-    # through the file (#1666); skipping the write lets a rerun self-heal.
+    t["extract"] = _pc() - _t0
     if not bypass_cache and "error" not in result and result.get("nodes"):
+        _t0 = _pc()
         save_cached(path, result, root, cache_root=cache_location)
-    return idx, result
+        t["cache_write"] = _pc() - _t0
+    return idx, result, t
 
 
 def _extract_parallel(
@@ -5551,6 +5647,18 @@ def _extract_parallel(
     done_count = 0
     failed: list[int] = []  # positions into uncached_work whose future failed
     _PROGRESS_INTERVAL = 100
+    _wsum: dict[str, float] = {}
+    if _EXTRACT_PROFILE:
+        try:
+            _affinity = len(os.sched_getaffinity(0))
+        except AttributeError:
+            _affinity = -1
+        _prof_print("pool", f"{max_workers} workers "
+                            f"(cpu_count={os.cpu_count()}, affinity={_affinity}, "
+                            f"start_method={__import__('multiprocessing').get_start_method()})")
+        _prof_print("pool.work_items", str(len(work_items)))
+        _pool_wall0 = time.perf_counter()
+        _pool_self0, _pool_kids0 = _cpu_times()
     try:
         with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as pool:
             futures = {
@@ -5559,8 +5667,12 @@ def _extract_parallel(
             }
             for future in concurrent.futures.as_completed(futures):
                 try:
-                    idx, result = future.result()
+                    _res = future.result()
+                    idx, result = _res[0], _res[1]
                     per_file[idx] = result
+                    if len(_res) > 2:
+                        for _k, _v in _res[2].items():
+                            _wsum[_k] = _wsum.get(_k, 0.0) + _v
                 except concurrent.futures.process.BrokenProcessPool:
                     # #2444: a pool that dies while results are being consumed
                     # raises BrokenProcessPool from every pending future. It
@@ -5599,6 +5711,8 @@ def _extract_parallel(
             "parallel=False to extract() to skip the pool entirely.",
             flush=True,
         )
+        if _EXTRACT_PROFILE:
+            _prof_print("pool.BROKEN", "pool died; remaining files extract SEQUENTIALLY")
         return False
     if failed:
         # #2445: retry per-future failures once, in-process, instead of leaving
@@ -5620,6 +5734,20 @@ def _extract_parallel(
             f"  AST extraction: {_done}/{_done} uncached files (100%) [{max_workers} workers]",
             flush=True,
         )
+    if _EXTRACT_PROFILE:
+        _pool_wall = time.perf_counter() - _pool_wall0
+        _self, _kids = _cpu_times()
+        _self -= _pool_self0
+        _kids -= _pool_kids0
+        _busy = sum(v for k, v in _wsum.items() if k not in ("files", "bytes"))
+        _prof_print("pool.wall", f"{_pool_wall:.1f}s  (capacity {_pool_wall * max_workers:.0f} worker-s)")
+        _prof_print("pool.cpu_children", f"{_kids:.1f}s  ({_kids / max(_pool_wall * max_workers, 1e-9) * 100:.0f}% of capacity)")
+        _prof_print("pool.cpu_parent", f"{_self:.1f}s  (executor queue-management thread: result UNPICKLING)")
+        _prof_print("worker.files", f"{int(_wsum.get('files', 0))} files, {_wsum.get('bytes', 0) / 1e6:.0f} MB")
+        for _k in ("cache_probe", "dispatch", "extract", "cache_write"):
+            _v = _wsum.get(_k, 0.0)
+            _prof_print(f"worker.{_k}", f"{_v:.1f}s  ({_v / max(_busy, 1e-9) * 100:.0f}% of worker busy)")
+        _prof_print("worker.busy_total", f"{_busy:.1f}s  ({_busy / max(_kids, 1e-9) * 100:.0f}% of children CPU)")
     return True
 
 
@@ -5768,6 +5896,7 @@ def extract(
     # Phase 1: separate cached hits from uncached work
     per_file: list[dict | None] = [None] * total
     uncached_work: list[tuple[int, Path]] = []
+    _p_t0 = time.perf_counter() if _EXTRACT_PROFILE else 0.0
 
     for i, path in enumerate(paths):
         if _get_extractor(path) is None:
@@ -5780,6 +5909,13 @@ def extract(
                 per_file[i] = cached
                 continue
         uncached_work.append((i, path))
+
+    if _EXTRACT_PROFILE:
+        _prof_print("phase1_cache_probe",
+                    f"{time.perf_counter() - _p_t0:.1f}s  "
+                    f"(serial, parent: file_hash + cache lookup for {total} paths, "
+                    f"{len(uncached_work)} misses)")
+        _p_t0 = time.perf_counter()
 
     # Phase 2: extract uncached files (parallel or sequential)
     if uncached_work:
@@ -5796,6 +5932,10 @@ def extract(
                 [(i, p) for (i, p) in uncached_work if per_file[i] is None],
                 per_file, root, total, cache_location,
             )
+
+    if _EXTRACT_PROFILE:
+        _prof_print("phase2_extract", f"{time.perf_counter() - _p_t0:.1f}s  (pool or sequential)")
+        _p_t0 = time.perf_counter()
 
     # Fill any remaining None slots. With the #2444/#2445 handling above this
     # is unreachable; the error marker keeps any regression loud (and out of
@@ -5971,6 +6111,7 @@ def extract(
             file=sys.stderr, flush=True,
         )
 
+    _p3 = _MarkTimer(_EXTRACT_PROFILE)
     all_nodes: list[dict] = []
     all_edges: list[dict] = []
     all_raw_calls: list[dict] = []
@@ -5984,7 +6125,10 @@ def extract(
     # marker set in the per-file extractor. Populated just before the pass that uses it.
     callable_nids: set[str] = set()
 
+    _p3.mark("merge_per_file")
+
     _augment_symbol_resolution_edges(paths, all_nodes, all_edges, root)
+    _p3.mark("augment_symbol_res")
 
     # Merge a header-declared class (and its methods) with its sibling-impl
     # definition into ONE node (C/C++/ObjC #1547/#1556). Runs BEFORE the id-remap
@@ -5993,6 +6137,7 @@ def extract(
     # them (foo_h vs foo_cpp), so the collapse must happen first. Collapsing here
     # also means disambiguation sees one source_file per id and won't split them.
     _merge_decl_def_classes(all_nodes, all_edges)
+    _p3.mark("merge_decl_def")
 
     # Remap file node IDs from absolute-path-derived to the canonical
     # {parent_dir}_{stem} spec form so (a) graph.json edge endpoints are stable
@@ -6399,11 +6544,18 @@ def extract(
     # Repoint Python absolute imports onto the real file nodes under a nested
     # (src/) package root before the resolver/import-evidence passes run, so the
     # graph is identical regardless of scan root (#2072).
+    _p3.mark("id_remap")
+
     _repoint_python_package_imports(paths, all_nodes, all_edges, root)
+    _p3.mark("repoint_py_pkg")
     _merge_swift_extensions(per_file, all_nodes, all_edges)
+    _p3.mark("merge_swift")
     _merge_csharp_partial_class_nodes(per_file, all_nodes, all_edges, paths, root)
+    _p3.mark("merge_csharp_partial")
     _disambiguate_colliding_node_ids(all_nodes, all_edges, all_raw_calls, root)
+    _p3.mark("disambiguate_ids")
     _canonicalize_csharp_namespace_nodes(all_nodes, all_edges)
+    _p3.mark("canon_csharp_ns")
     # PHP namespace/use disambiguation must run BEFORE the unique-stub rewire:
     # the false merge (#1923) happens inside the rewire when a bare-name stub
     # matches a unique internal class from a different namespace.
@@ -6451,6 +6603,7 @@ def extract(
                 "Go type-reference resolution failed, skipping: %s", exc
             )
     _rewire_unique_stub_nodes(all_nodes, all_edges)
+    _p3.mark("rewire_stubs")
 
     # Add cross-file class-level edges (Python only - uses Python parser internally)
     py_paths = [p for p in paths if p.suffix == ".py"]
@@ -6534,6 +6687,8 @@ def extract(
             import logging
             logging.getLogger(__name__).warning("Bash cross-file call resolution failed, skipping: %s", exc)
 
+    _p3.mark("crossfile_py_java_cs_bash")
+
     # Cross-file call resolution for all languages
     # Each extractor saved unresolved calls in raw_calls. Now that we have all
     # nodes from all files, resolve any callee that exists in another file.
@@ -6599,10 +6754,13 @@ def extract(
     # (ids are final) but before the import-evidence index just below reads the
     # edges — so genuine imported calls get promoted INFERRED -> EXTRACTED. The
     # tail registry run (run_language_resolvers below) would be too late.
+    _p3.mark("build_label_index")
+
     run_language_resolvers(
         paths, per_file, all_nodes, all_edges,
         resolvers=[_KOTLIN_IMPORT_TARGET_RESOLVER],
     )
+    _p3.mark("kotlin_import_resolver")
 
     # Build evidence index from import edges so cross-file calls backed by an
     # explicit import statement can be promoted from INFERRED to EXTRACTED.
@@ -6668,6 +6826,10 @@ def extract(
     # of these files with no import evidence is gated below (#1659).
     _JS_TS_CALL_SUFFIXES = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
     _go_module_cache: dict[Path, str | None] = {}
+    _p3.mark("evidence_index")
+    if _EXTRACT_PROFILE:
+        _prof_print("phase3.raw_calls_count", str(len(all_raw_calls)))
+
     for rc in all_raw_calls:
         callee = rc.get("callee", "")
         if not callee:
@@ -6867,6 +7029,8 @@ def extract(
                 "weight": 1.0,
             })
 
+    _p3.mark("direct_call_loop")
+
     # Cross-file, language-specific member-call resolution. Runs after the shared
     # call pass so node ids/caller_nids are final; each pass is additive (only the
     # receiver-typed/qualified calls the shared pass skipped) with its own
@@ -6890,6 +7054,8 @@ def extract(
         all_edges.extend(_rl_edges[_e0:])
     else:
         run_language_resolvers(paths, per_file, all_nodes, all_edges)
+
+    _p3.mark("member_call_resolvers")
 
     # Relativize source_file fields so paths are portable across machines (#555).
     # When the node's id was itself minted from the absolute path, remap it to a
@@ -7074,6 +7240,14 @@ def extract(
         _sf = _item.get("source_file")
         if _sf and "\\" in str(_sf):
             _item["source_file"] = PurePath(_sf).as_posix()
+
+    _p3.mark("relativize_tail")
+    if _EXTRACT_PROFILE:
+        _p3.report("phase3")
+        _prof_print("phase3_merge_resolve",
+                    f"{time.perf_counter() - _p_t0:.1f}s  "
+                    f"(serial, parent: warnings + merge + cross-file resolution; "
+                    f"{len(all_nodes)} nodes, {len(all_edges)} edges)")
 
     return {
         "nodes": all_nodes,
