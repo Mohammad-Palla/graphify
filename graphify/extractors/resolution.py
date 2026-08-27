@@ -640,14 +640,40 @@ def _vue_mask_non_script(src: str) -> tuple[str, str | None]:
     out.append(_blank(src[pos:]))
     return "".join(out), lang
 
+# Memo for _source_key. It is called once per node, per edge and per raw_call —
+# over a million times on a large corpus — but the number of DISTINCT
+# source_file strings is bounded by the file count (~15k on Bun), so almost
+# every call recomputes an answer already known. Each miss costs a pathlib
+# parse plus a `.resolve()`, and `.resolve()` walks the filesystem: this one
+# function was responsible for ~40% of all Path() constructions and for the
+# bulk of the 5.4M lstat syscalls measured in the post-extraction tail.
+#
+# Cleared per extract() run (see _clear_resolution_caches) rather than held for
+# the process lifetime: `.resolve()` reads the filesystem, so a long-lived
+# `graphify watch` / MCP process must not serve a symlink resolution from a
+# previous rebuild. Same lifetime rule the tsconfig/workspace caches already use.
+_SOURCE_KEY_CACHE: dict[tuple[str, str], str] = {}
+
+
+def _clear_resolution_caches() -> None:
+    """Drop per-run memo state. Called at the top of extract()."""
+    _SOURCE_KEY_CACHE.clear()
+
+
 def _source_key(source_file: str, root: Path) -> str:
     if not source_file:
         return ""
+    memo_key = (source_file, str(root))
+    cached = _SOURCE_KEY_CACHE.get(memo_key)
+    if cached is not None:
+        return cached
     source_path = Path(source_file)
     try:
-        return str(source_path.resolve().relative_to(root))
+        result = str(source_path.resolve().relative_to(root))
     except Exception:
-        return str(source_path)
+        result = str(source_path)
+    _SOURCE_KEY_CACHE[memo_key] = result
+    return result
 
 def _node_disambiguation_source_key(node: dict, root: Path) -> str:
     source_file = str(node.get("source_file", ""))

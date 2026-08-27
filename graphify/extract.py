@@ -78,6 +78,7 @@ from graphify.extractors.resolution import (  # noqa: E402,F401
     _WORKSPACE_MANIFEST_NAMES,
     _apply_symbol_resolution_facts,
     _augment_symbol_resolution_edges,
+    _clear_resolution_caches,
     _collect_js_symbol_resolution_facts,
     _collect_python_symbol_resolution_facts,
     _contained_in_package,
@@ -2265,11 +2266,29 @@ _CASE_INSENSITIVE_EXTS = frozenset({
 })
 
 
+# Suffix memo shared by the two language classifiers below. Both are called once
+# per raw_call AND once per candidate inside the cross-file call-resolution loop,
+# so on a large corpus they run into the millions — while the set of distinct
+# source_file strings is bounded by the file count. Caching the string -> suffix
+# step (rather than rewriting it as os.path.splitext) keeps the result BYTE
+# IDENTICAL to pathlib's, including its trailing-separator and dotfile handling.
+_SUFFIX_CACHE: dict[str, str] = {}
+
+
+def _cached_suffix(source_file: object) -> str:
+    key = str(source_file)
+    suffix = _SUFFIX_CACHE.get(key)
+    if suffix is None:
+        suffix = Path(key).suffix.lower()
+        _SUFFIX_CACHE[key] = suffix
+    return suffix
+
+
 def _lang_is_case_insensitive(source_file: object) -> bool:
     """True when the file's language resolves identifiers case-insensitively (#1581)."""
     if not source_file:
         return False
-    return Path(str(source_file)).suffix.lower() in _CASE_INSENSITIVE_EXTS
+    return _cached_suffix(source_file) in _CASE_INSENSITIVE_EXTS
 
 
 # Language interop families for cross-file call resolution. A call in one language
@@ -2315,7 +2334,7 @@ def _lang_family(source_file: object) -> str | None:
     """Interop family of the file's language, or None when unknown/not code."""
     if not source_file:
         return None
-    return _LANG_FAMILY_BY_EXT.get(Path(str(source_file)).suffix.lower())
+    return _LANG_FAMILY_BY_EXT.get(_cached_suffix(source_file))
 
 
 # A language's own built-in throwable hierarchy, keyed by the interop family of
@@ -5856,6 +5875,12 @@ def extract(
     _TSCONFIG_BASEURL_CACHE.clear()
     _XAML_CSHARP_CLASS_CACHE.clear()
     _MD_LINK_INDEX_CACHE.clear()
+    # Path-derived memos used by the post-extraction resolution tail. Cleared per
+    # run for the same reason as the caches above: `graphify watch` and the MCP
+    # server call extract() repeatedly in one process, and _source_key's entries
+    # embed a filesystem `.resolve()`.
+    _SUFFIX_CACHE.clear()
+    _clear_resolution_caches()
 
     # Infer a common root for cache keys (use first diverging segment, not sum of all matches)
     try:
