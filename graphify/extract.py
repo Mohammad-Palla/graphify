@@ -6152,7 +6152,13 @@ def extract(
 
     _p3.mark("merge_per_file")
 
-    _augment_symbol_resolution_edges(paths, all_nodes, all_edges, root)
+    # Forward the caller's pool controls: extract(parallel=False) is documented
+    # as the way to skip process pools entirely (see _extract_parallel's own
+    # BrokenProcessPool message), so it must bind the symbol-resolution pool too.
+    _augment_symbol_resolution_edges(
+        paths, all_nodes, all_edges, root,
+        parallel=parallel, max_workers=max_workers,
+    )
     _p3.mark("augment_symbol_res")
 
     # Merge a header-declared class (and its methods) with its sibling-impl

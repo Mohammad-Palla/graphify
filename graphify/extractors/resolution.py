@@ -1670,12 +1670,9 @@ def _collect_js_facts_one_file(path: Path) -> "tuple[_SymbolResolutionFacts, _Sy
                 )
             )
 
-
     return facts, class_member_facts
 
 
-# Below this many JS/TS files the pool costs more (process spawn + module
-# re-import) than the serial walk it replaces.
 # ── Per-file symbol-fact collection ───────────────────────────────────────────
 #
 # Every language's collector has the same shape: filter the corpus to the
@@ -1706,40 +1703,48 @@ def _merge_symbol_facts(dst: _SymbolResolutionFacts, src: _SymbolResolutionFacts
         getattr(dst, spec.name).extend(getattr(src, spec.name))
 
 
-def _map_facts_parallel(collect_one, selected: list[Path]) -> "list | None":
-    """Run ``collect_one`` over ``selected`` across processes, in input order.
+def _facts_pool_workers(selected: list[Path], max_workers: "int | None") -> "int | None":
+    """Worker count for the fact pool, or None when a pool should not be used.
 
-    Returns None on any failure — a single-worker pool (pure overhead), a
-    broken pool, an unpicklable payload — so the caller falls back to the
-    serial path rather than losing facts.
+    Deliberately a SEPARATE function from the mapping below. _map_facts_parallel
+    is a generator, and a generator function returns a generator object no
+    matter what — a `return None` inside it would only end iteration, so a
+    caller testing the result against None would see "pool ran, produced
+    nothing" and silently merge zero facts. Resolving the decision here keeps
+    the sentinel meaningful.
     """
-    import concurrent.futures
-
-    env_raw = os.environ.get("GRAPHIFY_MAX_WORKERS", "").strip()
-    cpu_cap = None
-    if env_raw:
-        try:
-            value = int(env_raw)
-            if value > 0:
-                cpu_cap = value
-        except ValueError:
-            pass
-    if cpu_cap is None:
-        cpu_cap = os.cpu_count() or 4
-    max_workers = max(1, min(cpu_cap, len(selected)))
+    if max_workers is None:
+        env_raw = os.environ.get("GRAPHIFY_MAX_WORKERS", "").strip()
+        if env_raw:
+            try:
+                value = int(env_raw)
+                if value > 0:
+                    max_workers = value
+            except ValueError:
+                pass
+    if max_workers is None:
+        max_workers = os.cpu_count() or 4
+    max_workers = max(1, min(max_workers, len(selected)))
     if sys.platform == "win32":
         # Same CPython WaitForMultipleObjects ceiling extract() clamps to.
         max_workers = min(max_workers, 61)
     if max_workers == 1:
-        return None
+        return None  # a one-worker pool is pure overhead; run serially instead
+    return max_workers
 
-    try:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as pool:
-            # Executor.map yields in INPUT order — that is what keeps the
-            # merged fact lists identical to a serial walk.
-            return list(pool.map(collect_one, selected, chunksize=16))
-    except Exception:
-        return None
+
+def _map_facts_parallel(collect_one, selected: list[Path], workers: int):
+    """Yield ``collect_one(path)`` for each path, across processes, in INPUT order.
+
+    Consumed lazily so per-file results are merged and released as they arrive
+    rather than all being materialised first.
+    """
+    import concurrent.futures
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+        # Executor.map yields in INPUT order — that is what keeps the merged
+        # fact lists identical to a serial walk.
+        yield from pool.map(collect_one, selected, chunksize=16)
 
 
 def _collect_file_symbol_facts(
@@ -1748,6 +1753,8 @@ def _collect_file_symbol_facts(
     *,
     select,
     collect_one,
+    parallel: bool = True,
+    max_workers: "int | None" = None,
 ) -> None:
     """Collect one language's per-file symbol facts into ``facts``.
 
@@ -1755,6 +1762,11 @@ def _collect_file_symbol_facts(
     so it may be a lambda. ``collect_one(path)`` must be module level (or a
     functools.partial of one) so it can be pickled to a worker, and returns
     ``(facts, deferred)``.
+
+    ``parallel`` / ``max_workers`` are threaded down from extract() so the
+    caller's escape hatch means what it says — extract(parallel=False) must not
+    spawn a pool here either, and extract(max_workers=N) must bound this pool
+    too, not just the extraction one.
 
     Ordering is preserved exactly, which is the whole correctness argument:
 
@@ -1771,25 +1783,61 @@ def _collect_file_symbol_facts(
     if not selected:
         return
 
-    results = None
-    if len(selected) >= _FACTS_PARALLEL_THRESHOLD:
-        results = _map_facts_parallel(collect_one, selected)
-    if results is None:
-        results = (collect_one(path) for path in selected)
+    workers = None
+    if parallel and len(selected) >= _FACTS_PARALLEL_THRESHOLD:
+        workers = _facts_pool_workers(selected, max_workers)
+    if workers is not None:
+        # Merge into a scratch so a pool that dies mid-iteration leaves `facts`
+        # untouched and the serial retry below cannot double-append.
+        scratch = _SymbolResolutionFacts()
+        deferred_scratch = _SymbolResolutionFacts()
+        try:
+            for file_facts, deferred in _map_facts_parallel(collect_one, selected, workers):
+                _merge_symbol_facts(scratch, file_facts)
+                _merge_symbol_facts(deferred_scratch, deferred)
+            _merge_symbol_facts(facts, scratch)
+            _merge_symbol_facts(facts, deferred_scratch)
+            return
+        except (KeyboardInterrupt, TimeoutError):
+            # The rebuild watchdog installed by `graphify hook install` raises
+            # TimeoutError from a ONE-SHOT SIGALRM (hooks.py). Swallowing it
+            # spends the alarm and then re-runs the whole collection serially
+            # with nothing armed, so a git checkout could hang forever. Both of
+            # these mean "stop", not "retry more slowly".
+            raise
+        except Exception as exc:
+            # BrokenProcessPool, a spawn-context import failure, an unpicklable
+            # payload, MemoryError under an inherited RLIMIT_AS. Recoverable —
+            # but say so, or an environment where the pool can never work pays
+            # full setup cost every run and silently gets no speedup.
+            print(
+                f"  warning: parallel symbol-fact collection failed "
+                f"({type(exc).__name__}: {exc}); falling back to serial.",
+                file=sys.stderr, flush=True,
+            )
 
     deferred_all = _SymbolResolutionFacts()
-    for file_facts, deferred in results:
+    for path in selected:
+        file_facts, deferred = collect_one(path)
         _merge_symbol_facts(facts, file_facts)
         _merge_symbol_facts(deferred_all, deferred)
     _merge_symbol_facts(facts, deferred_all)
 
 
-def _collect_js_symbol_resolution_facts(paths: list[Path], facts: _SymbolResolutionFacts) -> None:
+def _collect_js_symbol_resolution_facts(
+    paths: list[Path],
+    facts: _SymbolResolutionFacts,
+    *,
+    parallel: bool = True,
+    max_workers: "int | None" = None,
+) -> None:
     _collect_file_symbol_facts(
         paths,
         facts,
         select=lambda path: path.suffix in _JS_CACHE_BYPASS_SUFFIXES,
         collect_one=_collect_js_facts_one_file,
+        parallel=parallel,
+        max_workers=max_workers,
     )
 
 
@@ -2008,12 +2056,17 @@ def _collect_python_symbol_resolution_facts(
     paths: list[Path],
     root: Path,
     facts: _SymbolResolutionFacts,
+    *,
+    parallel: bool = True,
+    max_workers: "int | None" = None,
 ) -> None:
     _collect_file_symbol_facts(
         paths,
         facts,
         select=lambda path: path.suffix == ".py",
         collect_one=functools.partial(_collect_python_facts_one_file, root=root),
+        parallel=parallel,
+        max_workers=max_workers,
     )
 
 
@@ -2027,20 +2080,24 @@ def _augment_symbol_resolution_edges(
     nodes: list[dict],
     edges: list[dict],
     root: Path,
+    *,
+    parallel: bool = True,
+    max_workers: "int | None" = None,
 ) -> None:
     facts = _SymbolResolutionFacts()
+    _pool = {"parallel": parallel, "max_workers": max_workers}
     if not _AUGMENT_PROFILE:
-        _collect_js_symbol_resolution_facts(paths, facts)
-        _collect_python_symbol_resolution_facts(paths, root, facts)
+        _collect_js_symbol_resolution_facts(paths, facts, **_pool)
+        _collect_python_symbol_resolution_facts(paths, root, facts, **_pool)
         _apply_symbol_resolution_facts(paths, nodes, edges, root, facts)
         return
 
     import time as _time
     _t = _time.perf_counter()
-    _collect_js_symbol_resolution_facts(paths, facts)
+    _collect_js_symbol_resolution_facts(paths, facts, **_pool)
     _js = _time.perf_counter() - _t
     _t = _time.perf_counter()
-    _collect_python_symbol_resolution_facts(paths, root, facts)
+    _collect_python_symbol_resolution_facts(paths, root, facts, **_pool)
     _py = _time.perf_counter() - _t
     _t = _time.perf_counter()
     _apply_symbol_resolution_facts(paths, nodes, edges, root, facts)

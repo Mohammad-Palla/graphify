@@ -150,13 +150,19 @@ _PARENT_PARTS_CACHE: dict[str, tuple] = {}
 
 
 def _parent_parts(source_file: str) -> tuple:
-    """Path segments of ``source_file``'s parent directory, memoized."""
-    cached = _PARENT_PARTS_CACHE.get(source_file)
+    """Path segments of ``source_file``'s parent directory, memoized.
+
+    The key is ``str(source_file)``, never the argument itself: PurePath
+    compares and hashes case-INSENSITIVELY on Windows, so a PurePath key would
+    let two paths differing only in case share one entry.
+    """
+    key = str(source_file)
+    cached = _PARENT_PARTS_CACHE.get(key)
     if cached is None:
-        cached = PurePosixPath(str(source_file).replace("\\", "/")).parent.parts
+        cached = PurePosixPath(key.replace("\\", "/")).parent.parts
         if len(_PARENT_PARTS_CACHE) >= _PATH_MEMO_MAX:
             _PARENT_PARTS_CACHE.clear()
-        _PARENT_PARTS_CACHE[source_file] = cached
+        _PARENT_PARTS_CACHE[key] = cached
     return cached
 
 
@@ -174,12 +180,17 @@ def _is_test_path(path: str) -> bool:
     """
     if not path:
         return False
-    cached = _TEST_PATH_CACHE.get(path)
+    # Keyed on str(), never the argument: three of _TEST_FILENAME_PATTERNS are
+    # deliberately case-SENSITIVE (``*Test.java``, ``*Tests.java``,
+    # ``*Tests.cs``) while PureWindowsPath hashes case-insensitively, so a
+    # PurePath key would make FooTest.java and footest.java collide.
+    key = str(path)
+    cached = _TEST_PATH_CACHE.get(key)
     if cached is None:
-        cached = _compute_is_test_path(path)
+        cached = _compute_is_test_path(key)
         if len(_TEST_PATH_CACHE) >= _PATH_MEMO_MAX:
             _TEST_PATH_CACHE.clear()
-        _TEST_PATH_CACHE[path] = cached
+        _TEST_PATH_CACHE[key] = cached
     return cached
 
 
