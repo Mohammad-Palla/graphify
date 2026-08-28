@@ -60,7 +60,7 @@ from graphify.extractors.terraform import extract_terraform  # noqa: F401
 from graphify.extractors.verilog import extract_verilog  # noqa: F401
 from graphify.extractors.zig import extract_zig  # noqa: F401
 from graphify.security import sanitize_metadata
-from graphify.paths import disambiguate_ambiguous_candidates
+from graphify.paths import clear_resolve_cache, disambiguate_ambiguous_candidates, resolve_cached
 
 from graphify.extractors.models import LanguageConfig, _JS_CACHE_BYPASS_SUFFIXES, _NamespaceExportFact, _StarExportFact, _SymbolAliasFact, _SymbolDeclarationFact, _SymbolExportFact, _SymbolImportFact, _SymbolResolutionFacts, _SymbolUseFact, _WORKSPACE_PACKAGE_CACHE  # noqa: E402,F401
 
@@ -5880,6 +5880,7 @@ def extract(
     # server call extract() repeatedly in one process, and _source_key's entries
     # embed a filesystem `.resolve()`.
     _SUFFIX_CACHE.clear()
+    clear_resolve_cache()
     _clear_resolution_caches()
 
     # Infer a common root for cache keys (use first diverging segment, not sum of all matches)
@@ -6399,7 +6400,7 @@ def extract(
             if n.get("type") == "package":
                 continue
             try:
-                entry = prefix_remap.get(Path(sf).resolve())
+                entry = prefix_remap.get(resolve_cached(sf))
             except Exception:
                 continue
             if entry is None:
@@ -6504,7 +6505,7 @@ def extract(
 
         def _decompose(target: str, tf: str) -> "tuple[str, str] | None":
             try:
-                forms = stem_forms.get(Path(tf).resolve())
+                forms = stem_forms.get(resolve_cached(tf))
             except (OSError, RuntimeError):
                 return None
             if not forms:
@@ -7139,7 +7140,7 @@ def extract(
             canonical_id = _file_node_id(rel)
             new_sf = rel.as_posix()
         try:
-            sf_resolved = sf_path.resolve()
+            sf_resolved = resolve_cached(sf_path)
         except (OSError, RuntimeError):
             sf_resolved = sf_path
         # Learn the STEM (extension-dropped) forms too: symbol producers mint

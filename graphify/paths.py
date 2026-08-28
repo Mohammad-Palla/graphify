@@ -147,6 +147,40 @@ _TEST_FILENAME_PATTERNS = (
 _PATH_MEMO_MAX = 200_000
 _TEST_PATH_CACHE: dict[str, bool] = {}
 _PARENT_PARTS_CACHE: dict[str, tuple] = {}
+_RESOLVE_CACHE: dict[str, Path] = {}
+
+
+def resolve_cached(path: "Path | str") -> Path:
+    """``Path(path).resolve()``, memoized for the life of one extract() run.
+
+    ``resolve()`` lstat-walks every component, so it is the one path helper that
+    actually touches the filesystem. The resolution tail re-resolves the same few
+    thousand paths hundreds of thousands of times across ~10 call sites; on Bun
+    that was 29% of the whole tail.
+
+    Unlike the two memos above -- pure string functions, safe for the process
+    lifetime -- this one reads the filesystem, so `clear_resolve_cache()` drops it
+    per extract() run: `graphify watch` and the MCP server call extract()
+    repeatedly in one process and must observe symlink/layout changes between
+    runs. Keyed on the raw string (never the Path: PureWindowsPath hashes
+    case-INSENSITIVELY, so two paths differing only in case would collide).
+
+    Exceptions propagate uncached, so callers' existing OSError/RuntimeError
+    handling behaves exactly as it did with a bare ``.resolve()``.
+    """
+    key = str(path)
+    cached = _RESOLVE_CACHE.get(key)
+    if cached is None:
+        cached = Path(key).resolve()
+        if len(_RESOLVE_CACHE) >= _PATH_MEMO_MAX:
+            _RESOLVE_CACHE.clear()
+        _RESOLVE_CACHE[key] = cached
+    return cached
+
+
+def clear_resolve_cache() -> None:
+    """Drop the filesystem-backed resolve memo. Called once per extract() run."""
+    _RESOLVE_CACHE.clear()
 
 
 def _parent_parts(source_file: str) -> tuple:

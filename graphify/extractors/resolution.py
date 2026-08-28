@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 from pathlib import Path
+from graphify.paths import resolve_cached
 from graphify.extractors.models import LanguageConfig, _JS_CACHE_BYPASS_SUFFIXES, _NamespaceExportFact, _StarExportFact, _SymbolAliasFact, _SymbolDeclarationFact, _SymbolExportFact, _SymbolImportFact, _SymbolResolutionFacts, _SymbolUseFact, _WORKSPACE_PACKAGE_CACHE  # noqa: E402,F401
 from graphify.extractors.base import (  # noqa: F401
     _LANGUAGE_BUILTIN_GLOBALS,
@@ -671,7 +672,7 @@ def _source_key(source_file: str, root: Path) -> str:
         return cached
     source_path = Path(source_file)
     try:
-        result = str(source_path.resolve().relative_to(root))
+        result = str(resolve_cached(source_path).relative_to(root))
     except Exception:
         result = str(source_path)
     _SOURCE_KEY_CACHE[memo_key] = result
@@ -843,7 +844,7 @@ def _js_source_path(source_file: str, root: Path) -> Path | None:
     if not path.is_absolute():
         path = root / path
     try:
-        return path.resolve()
+        return resolve_cached(path)
     except Exception:
         return path
 
@@ -867,8 +868,8 @@ def _apply_symbol_resolution_facts(
     ):
         return
 
-    path_by_resolved = {path.resolve(): path for path in paths}
-    source_file_id = {path.resolve(): _make_id(str(path)) for path in paths}
+    path_by_resolved = {resolve_cached(path): path for path in paths}
+    source_file_id = {resolve_cached(path): _make_id(str(path)) for path in paths}
     symbol_nodes: dict[tuple[Path, str], str] = {}
     for node in nodes:
         source_path = _js_source_path(str(node.get("source_file", "")), root)
@@ -1099,7 +1100,7 @@ def _apply_symbol_resolution_facts(
     # canonicalizes — or drop it when no file node id is available.
     owned = {str(n.get("id")) for n in nodes}
     for use_fact in facts.uses:
-        file_path = use_fact.file_path.resolve()
+        file_path = resolve_cached(use_fact.file_path)
         target_id = None
         unresolved_origin = local_aliases_by_file.get(file_path, {}).get(use_fact.local_name)
         if unresolved_origin is not None:
