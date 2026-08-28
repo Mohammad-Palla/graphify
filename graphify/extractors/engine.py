@@ -2882,6 +2882,28 @@ def _extract_generic(
     # above the grammar import because a routed language must not pay for loading
     # the Python grammar it will not use. `try_extract` never raises and never
     # reads the file unless it is actually going to handle it.
+    # The language of a file is fixed for the whole file, so every
+    # `config.ts_module == "tree_sitter_x"` below is loop-invariant -- yet the main
+    # walk body alone contains 43 of them and runs for EVERY node of every file, in
+    # every language. Bind them once here; the nested walkers pick them up as
+    # closure cells (LOAD_DEREF), which is a pointer read instead of an attribute
+    # lookup plus a string compare. Pure hoist: same values, same order of
+    # evaluation, computed once per file instead of once per node.
+    _ts_module = config.ts_module
+    _is_csharp = _ts_module == "tree_sitter_c_sharp"
+    _is_python = _ts_module == "tree_sitter_python"
+    _is_swift = _ts_module == "tree_sitter_swift"
+    _is_java = _ts_module == "tree_sitter_java"
+    _is_kotlin = _ts_module == "tree_sitter_kotlin"
+    _is_cpp = _ts_module == "tree_sitter_cpp"
+    _is_ruby = _ts_module == "tree_sitter_ruby"
+    _is_scala = _ts_module == "tree_sitter_scala"
+    _is_php = _ts_module == "tree_sitter_php"
+    _is_typescript = _ts_module == "tree_sitter_typescript"
+    _is_javascript = _ts_module == "tree_sitter_javascript"
+    _is_groovy = _ts_module == "tree_sitter_groovy"
+    _is_c = _ts_module == "tree_sitter_c"
+    _is_js_family = _is_javascript or _is_typescript
     _native = _kernel.try_extract(path, config, source_override)
     if _native is not None:
         return _native
@@ -2924,7 +2946,7 @@ def _extract_generic(
     # `_js_external_import_names`.
     js_external_imports: set[str] = (
         _js_external_import_names(root, source, str_path)
-        if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript")
+        if _is_js_family
         else set()
     )
     nodes: list[dict] = []
@@ -2994,12 +3016,12 @@ def _extract_generic(
     csharp_method_scopes: dict[int, tuple[object, str]] = {}
 
     csharp_interface_names: set[str] = set()
-    if config.ts_module == "tree_sitter_c_sharp":
+    if _is_csharp:
         csharp_interface_names = _csharp_pre_scan_interfaces(root, source)
 
     swift_protocol_names: set[str] = set()
     swift_class_names: set[str] = set()
-    if config.ts_module == "tree_sitter_swift":
+    if _is_swift:
         swift_protocol_names, swift_class_names = _swift_pre_scan(root, source)
 
     def add_node(nid: str, label: str, line: int, *, node_type: str | None = None,
@@ -3125,13 +3147,13 @@ def _extract_generic(
             # scope, splitting compact `Foo::Bar` names into segments so both
             # declaration styles converge on one `Foo::Bar` label (#2302).
             ruby_segments: list[str] = []
-            if config.ts_module == "tree_sitter_ruby":
+            if _is_ruby:
                 ruby_segments = class_name.split("::")
                 class_name = "::".join(ruby_namespace + ruby_segments)
             class_nid = _make_id(stem, ".".join(namespace_stack), class_name)
             line = node.start_point[0] + 1
             metadata = None
-            if config.ts_module == "tree_sitter_c_sharp":
+            if _is_csharp:
                 if parent_class_nid:
                     metadata = {"is_nested_type": True}
                 # #2332: `partial class Foo` split across files mints one node
@@ -3169,17 +3191,17 @@ def _extract_generic(
 
             # TS/JS decorators on the class and its members (@Component, @Injectable,
             # @Input, @Inject, @Entity, …). Decorators live only in class subtrees.
-            if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
+            if _is_js_family:
                 _ts_emit_decorator_edges(node, class_nid, stem, source,
                                          ensure_named_node, add_edge)
 
-            if config.ts_module == "tree_sitter_swift" and any(
+            if _is_swift and any(
                 c.type == "extension" for c in node.children
             ):
                 swift_extensions.append({"nid": class_nid, "label": class_name})
 
             # Python-specific: inheritance
-            if config.ts_module == "tree_sitter_python":
+            if _is_python:
                 args = node.child_by_field_name("superclasses")
                 if args:
                     for arg in args.children:
@@ -3189,7 +3211,7 @@ def _extract_generic(
                             add_edge(class_nid, base_nid, "inherits", line)
 
             # Swift-specific: conformance / inheritance
-            if config.ts_module == "tree_sitter_swift":
+            if _is_swift:
                 swift_kind = _swift_declaration_keyword(node) if t == "class_declaration" else "protocol"
                 seen_swift_base = False
                 for child in node.children:
@@ -3243,7 +3265,7 @@ def _extract_generic(
                                              context="generic_arg")
 
             # PHP-specific: extends → inherits, implements → implements, use → mixes_in
-            if config.ts_module == "tree_sitter_php":
+            if _is_php:
                 def _php_emit_base(base_name: str, rel: str, at_line: int) -> None:
                     if not base_name:
                         return
@@ -3288,7 +3310,7 @@ def _extract_generic(
                                                 "mixes_in", member.start_point[0] + 1)
 
             # Kotlin-specific: delegation_specifiers → inherits (constructor_invocation) / implements (user_type)
-            if config.ts_module == "tree_sitter_kotlin":
+            if _is_kotlin:
                 for child in node.children:
                     if child.type != "delegation_specifiers":
                         continue
@@ -3344,7 +3366,7 @@ def _extract_generic(
             # Ruby: `class Dog < Animal` puts the base class in the `superclass`
             # field (a `<` token followed by a constant or scope_resolution).
             # There was no Ruby branch, so every Ruby inherits edge was dropped.
-            if config.ts_module == "tree_sitter_ruby":
+            if _is_ruby:
                 sup = node.child_by_field_name("superclass")
                 if sup is not None:
                     base = ""
@@ -3396,7 +3418,7 @@ def _extract_generic(
                                 })
 
             # C#-specific: inheritance / interface implementation via base_list
-            if config.ts_module == "tree_sitter_c_sharp":
+            if _is_csharp:
                 csharp_type_params = _csharp_type_parameters_in_scope(node, source)
                 for child in node.children:
                     if child.type != "base_list":
@@ -3514,7 +3536,7 @@ def _extract_generic(
                     # absorb it; _resolve_java_type_references maps internal
                     # FQNs back to their real nodes (#2504). Groovy has no such
                     # resolver pass, so it keeps the legacy bare-name stub.
-                    if "." in anno_raw and config.ts_module == "tree_sitter_java":
+                    if "." in anno_raw and _is_java:
                         anno_name = anno_raw
                     target_nid = ensure_named_node(anno_name, line)
                     if target_nid != class_nid and target_nid not in annotation_targets:
@@ -3560,7 +3582,7 @@ def _extract_generic(
             # The first base after `extends` is `inherits`; each subsequent
             # type after `with` is `mixes_in`. Also walk class_parameters for
             # constructor-as-field type references.
-            if config.ts_module == "tree_sitter_scala":
+            if _is_scala:
                 extend = node.child_by_field_name("extend")
                 if extend is None:
                     for c in node.children:
@@ -3616,7 +3638,7 @@ def _extract_generic(
             # above is the analogue; Kotlin's is #2063. Grammar note: the list is
             # an UNNAMED child of the declaration, so child_by_field_name(
             # "parameters") returns None and the children must be scanned.
-            if config.ts_module == "tree_sitter_c_sharp" and t in (
+            if _is_csharp and t in (
                 "class_declaration",
                 "record_declaration",
                 "struct_declaration",
@@ -3668,7 +3690,7 @@ def _extract_generic(
             #       qualified_identifier                                -- "ns::Base"
             #       template_type                                       -- "Vec<int>"
             # Multiple bases are siblings separated by ',' tokens.
-            if config.ts_module == "tree_sitter_cpp":
+            if _is_cpp:
                 for child in node.children:
                     if child.type != "base_class_clause":
                         continue
@@ -3780,7 +3802,7 @@ def _extract_generic(
             if handled_event_listener:
                 return
 
-        if (config.ts_module == "tree_sitter_c_sharp"
+        if (_is_csharp
                 and t == "field_declaration"
                 and parent_class_nid):
             type_node = node.child_by_field_name("type")
@@ -3842,7 +3864,7 @@ def _extract_generic(
                                  line, context=ctx, metadata=metadata)
             return
 
-        if (config.ts_module == "tree_sitter_c_sharp"
+        if (_is_csharp
                 and t == "property_declaration"
                 and parent_class_nid):
             # C# auto-properties (`public Widget Main { get; set; }`) are the
@@ -3896,7 +3918,7 @@ def _extract_generic(
                                  line, context=ctx, metadata=metadata)
             return
 
-        if (config.ts_module == "tree_sitter_java"
+        if (_is_java
                 and t == "field_declaration"
                 and parent_class_nid):
             type_node = node.child_by_field_name("type")
@@ -3917,7 +3939,7 @@ def _extract_generic(
                                  line, context=ctx)
             return
 
-        if (config.ts_module == "tree_sitter_java"
+        if (_is_java
                 and t == "annotation_type_element_declaration"
                 and parent_class_nid):
             type_node = node.child_by_field_name("type")
@@ -3934,7 +3956,7 @@ def _extract_generic(
                              line, context=ctx)
             return
 
-        if (config.ts_module == "tree_sitter_php"
+        if (_is_php
                 and t == "property_declaration"
                 and parent_class_nid):
             for c in node.children:
@@ -3952,7 +3974,7 @@ def _extract_generic(
                 break
             return
 
-        if (config.ts_module == "tree_sitter_kotlin"
+        if (_is_kotlin
                 and t == "property_declaration"):
             # Field-type references stay class-gated: top-level properties keep
             # their pre-#2565 (no-references) behavior unchanged.
@@ -3990,7 +4012,7 @@ def _extract_generic(
                             initializer_nodes.append((owner_nid, sub))
             return
 
-        if (config.ts_module == "tree_sitter_swift"
+        if (_is_swift
                 and t == "property_declaration"
                 and parent_class_nid):
             line = node.start_point[0] + 1
@@ -4065,7 +4087,7 @@ def _extract_generic(
                     function_bodies.append((prop_nid, body_block))
             return
 
-        if (config.ts_module == "tree_sitter_scala"
+        if (_is_scala
                 and t in ("val_definition", "var_definition")
                 and parent_class_nid):
             type_node = node.child_by_field_name("type")
@@ -4091,7 +4113,7 @@ def _extract_generic(
         # shape a self-type's type position can take (type_identifier,
         # compound_type for `with`, refinement bodies via compound_type) --
         # reused unchanged.
-        if (config.ts_module == "tree_sitter_scala"
+        if (_is_scala
                 and t == "self_type"
                 and parent_class_nid):
             named = [c for c in node.children if c.is_named]
@@ -4106,7 +4128,7 @@ def _extract_generic(
                         add_edge(parent_class_nid, target_nid, "requires", line)
             return
 
-        if (config.ts_module == "tree_sitter_cpp"
+        if (_is_cpp
                 and t == "field_declaration"
                 and parent_class_nid):
             # Skip method prototypes (field_declaration with a function_declarator
@@ -4209,12 +4231,12 @@ def _extract_generic(
                 add_node(func_nid, f"{func_name}()", line)
                 add_edge(file_nid, func_nid, "contains", line)
             callable_def_nids.add(func_nid)  # function / method def is callable
-            if config.ts_module == "tree_sitter_python":
+            if _is_python:
                 local_bound_names[func_nid] = _python_local_bound_names(node, source)
-            elif config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
+            elif _is_js_family:
                 local_bound_names[func_nid] = _js_local_bound_names(node, source)
 
-            if config.ts_module == "tree_sitter_python":
+            if _is_python:
                 params_node = node.child_by_field_name("parameters")
                 for ref_name, role in _python_collect_param_refs(params_node, source):
                     ctx = "generic_arg" if role == "generic_arg" else "parameter_type"
@@ -4235,7 +4257,7 @@ def _extract_generic(
                                 _semantic_reference_edge(func_nid, target_nid, ctx, str_path, line)
                             )
 
-            if config.ts_module == "tree_sitter_c_sharp":
+            if _is_csharp:
                 csharp_type_params = _csharp_type_parameters_in_scope(node, source)
                 params_node = node.child_by_field_name("parameters")
                 if params_node is not None:
@@ -4286,7 +4308,7 @@ def _extract_generic(
                         add_edge(func_nid, target_nid, "references", line,
                                  context="attribute", metadata=metadata)
 
-            if config.ts_module == "tree_sitter_java":
+            if _is_java:
                 params_node = node.child_by_field_name("parameters")
                 if params_node is not None:
                     for p in params_node.children:
@@ -4325,7 +4347,7 @@ def _extract_generic(
                                  context="attribute")
                         annotation_targets.add(target_nid)
 
-            if config.ts_module == "tree_sitter_php":
+            if _is_php:
                 params_container = None
                 for c in node.children:
                     if c.type == "formal_parameters":
@@ -4371,7 +4393,7 @@ def _extract_generic(
                         if target_nid != func_nid:
                             add_edge(func_nid, target_nid, "references", line, context=ctx)
 
-            if config.ts_module == "tree_sitter_kotlin":
+            if _is_kotlin:
                 params_container = None
                 for c in node.children:
                     if c.type == "function_value_parameters":
@@ -4403,7 +4425,7 @@ def _extract_generic(
                         if target_nid != func_nid:
                             add_edge(func_nid, target_nid, "references", line, context=ctx)
 
-            if config.ts_module == "tree_sitter_swift":
+            if _is_swift:
                 for p in node.children:
                     if p.type != "parameter":
                         continue
@@ -4446,7 +4468,7 @@ def _extract_generic(
                                      metadata={"swift_plain_return": True}
                                      if plain_return and role == "type" else None)
 
-            if (config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript")
+            if (_is_js_family
                     and func_name == "constructor"):
                 params_node = node.child_by_field_name("parameters")
                 if params_node is not None:
@@ -4472,7 +4494,7 @@ def _extract_generic(
                                 break
 
             if config.ts_module in ("tree_sitter_c", "tree_sitter_cpp"):
-                collect = (_cpp_collect_type_refs if config.ts_module == "tree_sitter_cpp"
+                collect = (_cpp_collect_type_refs if _is_cpp
                            else _c_collect_type_refs)
                 return_node = node.child_by_field_name("type")
                 if return_node is not None:
@@ -4506,7 +4528,7 @@ def _extract_generic(
                                     add_edge(func_nid, target_nid, "references",
                                              line, context=ctx)
 
-            if config.ts_module == "tree_sitter_scala":
+            if _is_scala:
                 params_node = None
                 for c in node.children:
                     if c.type == "parameters":
@@ -4600,9 +4622,9 @@ def _extract_generic(
                     if m_body:
                         function_bodies.append((m_nid, m_body))
             if body:
-                if config.ts_module == "tree_sitter_java" and parent_class_nid:
+                if _is_java and parent_class_nid:
                     java_method_scopes[id(body)] = (node, parent_class_nid)
-                if config.ts_module == "tree_sitter_c_sharp" and parent_class_nid:
+                if _is_csharp and parent_class_nid:
                     csharp_method_scopes[id(body)] = (node, parent_class_nid)
                 function_bodies.append((func_nid, body))
                 if config.ts_module in (
@@ -4615,7 +4637,7 @@ def _extract_generic(
                         local_bound_names=local_bound_names,
                         function_bodies=function_bodies,
                     )
-                if config.ts_module == "tree_sitter_kotlin":
+                if _is_kotlin:
                     # #2347: Kotlin anonymous objects (`object : Foo { … }`,
                     # node type `object_literal`). The function branch never
                     # recurses into bodies and object_literal is not a
@@ -4702,7 +4724,7 @@ def _extract_generic(
             return
 
         # JS/TS arrow functions and C# namespaces — language-specific extra handling
-        if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
+        if _is_js_family:
             if _js_extra_walk(node, source, file_nid, stem, str_path,
                               nodes, edges, seen_ids, function_bodies,
                               parent_class_nid, add_node, add_edge,
@@ -4711,39 +4733,39 @@ def _extract_generic(
                 return
 
         # TS enum members, and namespace / module containers
-        if config.ts_module == "tree_sitter_typescript":
+        if _is_typescript:
             if _ts_extra_walk(node, source, file_nid, stem, str_path,
                               nodes, edges, seen_ids, function_bodies,
                               parent_class_nid, add_node, add_edge, walk):
                 return
 
-        if config.ts_module == "tree_sitter_c_sharp":
+        if _is_csharp:
             if _csharp_extra_walk(node, source, file_nid, stem, str_path,
                                    nodes, edges, seen_ids, function_bodies,
                                    parent_class_nid, add_node, add_edge, walk,
                                    namespace_stack, scope_stack):
                 return
 
-        if config.ts_module == "tree_sitter_swift":
+        if _is_swift:
             if _swift_extra_walk(node, source, file_nid, stem, str_path,
                                   nodes, edges, seen_ids, function_bodies,
                                   parent_class_nid, add_node, add_edge,
                                   ensure_named_node):
                 return
 
-        if config.ts_module == "tree_sitter_java":
+        if _is_java:
             if _java_extra_walk(node, source, file_nid, stem, str_path,
                                 nodes, edges, seen_ids, function_bodies,
                                 parent_class_nid, add_node, add_edge, walk):
                 return
 
-        if config.ts_module == "tree_sitter_kotlin":
+        if _is_kotlin:
             if _kotlin_extra_walk(node, source, file_nid, stem, str_path,
                                   nodes, edges, seen_ids, function_bodies,
                                   parent_class_nid, add_node, add_edge, walk):
                 return
 
-        if config.ts_module == "tree_sitter_ruby":
+        if _is_ruby:
             if _ruby_extra_walk(node, source, file_nid, stem, str_path,
                                 nodes, edges, seen_ids, function_bodies,
                                 parent_class_nid, add_node, add_edge, walk,
@@ -4770,7 +4792,7 @@ def _extract_generic(
             # sourceless stub the corpus rewire collapses onto its definition.
             # The owner ids mirror the definition branches below/above verbatim,
             # so the edge lands on the node the walk is about to create.
-            if config.ts_module == "tree_sitter_python":
+            if _is_python:
                 inner = node.child_by_field_name("definition")
                 inner_name = None
                 if inner is not None:
@@ -4809,7 +4831,7 @@ def _extract_generic(
         # Recurse transparently, entering the class_body's children directly
         # since a bare class_body would itself default-recurse and drop the
         # parent link. Companion `fun`s thereby become class-attributed methods.
-        if config.ts_module == "tree_sitter_kotlin" and t == "companion_object":
+        if _is_kotlin and t == "companion_object":
             for child in node.children:
                 if child.type == "class_body":
                     for member in child.children:
@@ -5061,7 +5083,7 @@ def _extract_generic(
             # svc.doThing()` links to the caller (#1630). Tracked closures
             # (const-assigned arrows) are walked with their own nid — skip to
             # avoid double-counting.
-            if (config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript")
+            if (_is_js_family
                     and node.type in _JS_DESCEND_TYPES):
                 body = node.child_by_field_name("body")
                 if body is not None and body not in _tracked_body_ids:
@@ -5083,13 +5105,13 @@ def _extract_generic(
         # pass records top-level require() declarations; this pass owns function
         # bodies, so detect lazy/cycle-breaking requires here and attribute the
         # dependency to the enclosing callable rather than silently dropping it.
-        if (config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript")
+        if (_is_js_family
                 and node.type in ("lexical_declaration", "variable_declaration")):
             _require_imports_js(node, source, caller_nid, stem, edges, str_path)
 
         if node.type in config.call_types:
             # JS/TS dynamic imports: await import('./foo.js')
-            if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
+            if _is_js_family:
                 if _dynamic_import_js(node, source, caller_nid, str_path,
                                       edges, seen_dyn_import_pairs):
                     # Still recurse into children (import().then(...) may have calls)
@@ -5106,7 +5128,7 @@ def _extract_generic(
             csharp_qualified_prefix: str | None = None
 
             # Special handling per language
-            if config.ts_module == "tree_sitter_swift":
+            if _is_swift:
                 # Swift: first child may be simple_identifier or navigation_expression
                 first = node.children[0] if node.children else None
                 if first:
@@ -5123,7 +5145,7 @@ def _extract_generic(
                         # resolve it through the file's type table.
                         recv_node = first.children[0] if first.children else None
                         swift_receiver = _swift_receiver_name(recv_node, source)
-            elif config.ts_module == "tree_sitter_kotlin":
+            elif _is_kotlin:
                 # Kotlin: first child may be simple_identifier/identifier or
                 # navigation_expression. PyPI's `tree_sitter_kotlin` produces
                 # `identifier` for plain identifier nodes; older grammar
@@ -5152,7 +5174,7 @@ def _extract_generic(
                         segments = _kotlin_nav_identifier_segments(first, source)
                         if segments is not None and len(segments) >= 3:
                             kotlin_qualified_prefix = ".".join(segments[:-1])
-            elif config.ts_module == "tree_sitter_scala":
+            elif _is_scala:
                 # Scala: first child
                 first = node.children[0] if node.children else None
                 if first:
@@ -5168,7 +5190,7 @@ def _extract_generic(
                                 if child.type == "identifier":
                                     callee_name = _read_text(child, source)
                                     break
-            elif config.ts_module == "tree_sitter_c_sharp" and node.type == "object_creation_expression":
+            elif _is_csharp and node.type == "object_creation_expression":
                 # `new Foo(...)` keeps the constructed type in the `type` field, so
                 # the invocation path below never sees it and a type a method only
                 # constructs stays unlinked — the C# twin of the Java gap in #1373.
@@ -5189,7 +5211,7 @@ def _extract_generic(
                     callee_name = type_info[0]
                     if type_info[1] and type_info[2]:
                         csharp_qualified_prefix = type_info[2]
-            elif config.ts_module == "tree_sitter_c_sharp" and node.type == "invocation_expression":
+            elif _is_csharp and node.type == "invocation_expression":
                 # C#: the invoked function is the `function` field. A member call
                 # `recv.Method(...)` is a member_access_expression (receiver in its
                 # `expression` field, method in `name`). Capture a simple-identifier
@@ -5301,7 +5323,7 @@ def _extract_generic(
                                 add_edge(caller_nid, call_target, "references",
                                          call_line, context="generic_arg",
                                          metadata=call_meta)
-            elif config.ts_module == "tree_sitter_php":
+            elif _is_php:
                 # PHP: distinguish call expression subtypes
                 if node.type == "function_call_expression":
                     func_node = node.child_by_field_name("function")
@@ -5318,7 +5340,7 @@ def _extract_generic(
                     name_node = node.child_by_field_name("name")
                     if name_node:
                         callee_name = _read_text(name_node, source)
-            elif config.ts_module == "tree_sitter_cpp":
+            elif _is_cpp:
                 # C++: function field, then field_expression/qualified_identifier
                 func_node = node.child_by_field_name(config.call_function_field) if config.call_function_field else None
                 if func_node:
@@ -5349,7 +5371,7 @@ def _extract_generic(
                         scope = func_node.child_by_field_name("scope")
                         if scope is not None:
                             member_receiver = _read_text(scope, source)
-            elif config.ts_module == "tree_sitter_java":
+            elif _is_java:
                 if node.type == "object_creation_expression":
                     # `new Foo(...)` — the constructed type is in the `type` field,
                     # not `name`, so the generic path misses it (#1373).
@@ -5375,7 +5397,7 @@ def _extract_generic(
                             if owner is not None and owner.type == "this" and field is not None:
                                 member_receiver = f"this.{_read_text(field, source)}"
                                 is_this_field_call = True
-            elif config.ts_module == "tree_sitter_ruby":
+            elif _is_ruby:
                 # Ruby's `call` node carries `receiver` and `method` as direct
                 # fields (no intermediate accessor node), so the generic accessor
                 # model doesn't apply. Read them directly and capture a simple
@@ -5421,7 +5443,7 @@ def _extract_generic(
                             if obj is not None and obj.type == "identifier":
                                 member_receiver = _read_text(obj, source)
                             elif (
-                                config.ts_module == "tree_sitter_python"
+                                _is_python
                                 and obj is not None
                                 and obj.type == "call"
                             ):
@@ -5466,16 +5488,16 @@ def _extract_generic(
                 # method (#1609). The receiver may be lowercase (`_server.Save()`),
                 # so this is broader than the capitalized/this-field Python rule.
                 _csharp_defer = (
-                    config.ts_module == "tree_sitter_c_sharp"
+                    _is_csharp
                     and is_member_call and member_receiver
                 )
                 _python_defer = (
-                    config.ts_module == "tree_sitter_python"
+                    _is_python
                     and is_member_call
                     and member_receiver not in {"self", "cls", "super"}
                 )
                 _java_defer = (
-                    config.ts_module == "tree_sitter_java" and is_member_call
+                    _is_java and is_member_call
                 )
                 if _python_defer or _java_defer or (
                     is_member_call
@@ -5526,7 +5548,7 @@ def _extract_generic(
                     }
                     # Ruby: attach the receiver's inferred type from the method's
                     # local `var = Const.new` bindings, when unambiguously known.
-                    if member_receiver and config.ts_module == "tree_sitter_ruby":
+                    if member_receiver and _is_ruby:
                         rc_entry["receiver_type"] = ruby_var_types.get(
                             caller_nid, {}
                         ).get(member_receiver)
@@ -5534,7 +5556,7 @@ def _extract_generic(
                     # claims it unambiguously: a `.h` file routes to extract_cpp or
                     # extract_objc by content, and both resolvers see `.h` in their
                     # suffix sets, so a source_file suffix alone can't separate them.
-                    if config.ts_module == "tree_sitter_cpp":
+                    if _is_cpp:
                         rc_entry["lang"] = "cpp"
                     # C#: tag the raw_call so _resolve_csharp_member_calls claims
                     # it, and stamp the receiver's type from the method's SCOPED
@@ -5542,7 +5564,7 @@ def _extract_generic(
                     # #2299, position-aware since #2472). `this.field.M()` is
                     # covered too: member_receiver is the bare field name, and
                     # class fields/properties are the base scope.
-                    if config.ts_module == "tree_sitter_c_sharp":
+                    if _is_csharp:
                         rc_entry["lang"] = "csharp"
                         if csharp_qualified_prefix:
                             rc_entry["qualified_prefix"] = csharp_qualified_prefix
@@ -5551,7 +5573,7 @@ def _extract_generic(
                         )
                         if receiver_type:
                             rc_entry["receiver_type"] = receiver_type
-                    if config.ts_module == "tree_sitter_java":
+                    if _is_java:
                         rc_entry["lang"] = "java"
                         receiver_type = (receiver_types or {}).get(member_receiver or "")
                         if receiver_type:
@@ -5578,7 +5600,7 @@ def _extract_generic(
             #      the enclosing function; it names a local value, not the module fn.
             #   2. CALLABLE TARGET — resolve only to a function / method / class def, so
             #      `process(config)` can't point at a same-named non-callable node.
-            if config.ts_module == "tree_sitter_python":
+            if _is_python:
                 args_node = node.child_by_field_name("arguments")
                 if args_node is not None:
                     enclosing_locals = local_bound_names.get(caller_nid, frozenset()) | extra_locals
@@ -5598,7 +5620,7 @@ def _extract_generic(
                 if getattr_ref is not None:
                     ref_name, loc = getattr_ref
                     _emit_indirect_by_name(ref_name, loc, caller_nid, "getattr")
-            elif config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
+            elif _is_js_family:
                 # JS/TS: a callback passed by name (`arr.map(fn)`, `setTimeout(fn)`,
                 # `el.addEventListener("x", fn)`). Positional identifier args only —
                 # inline arrows/function expressions are direct definitions, not a
@@ -5715,7 +5737,7 @@ def _extract_generic(
                         })
 
         # PHP class constant access: Foo::BAR → references_constant edge
-        if config.ts_module == "tree_sitter_php" and node.type == "class_constant_access_expression":
+        if _is_php and node.type == "class_constant_access_expression":
             class_name = _php_class_const_scope(node)
             if class_name:
                 tgt_nid = label_to_nid_ci.get(class_name.lower())
@@ -5739,13 +5761,13 @@ def _extract_generic(
         # tuple literal inside this body is an indirect dependency of the enclosing
         # function. Reuses the shared resolve-and-emit guard (callable-target-only,
         # not shadowed by a param/local, cross-file deferral).
-        if config.ts_module == "tree_sitter_python" and node.type in (
+        if _is_python and node.type in (
             "dictionary", "list", "set", "tuple"
         ):
             enclosing_locals = local_bound_names.get(caller_nid, frozenset()) | extra_locals
             for ident in _python_dispatch_value_idents(node):
                 _emit_indirect_ref(ident, caller_nid, enclosing_locals, "collection")
-        elif config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript") \
+        elif _is_js_family \
                 and node.type in ("object", "array"):
             enclosing_locals = local_bound_names.get(caller_nid, frozenset()) | extra_locals
             for ident in _js_dispatch_value_idents(node):
@@ -5756,11 +5778,11 @@ def _extract_generic(
         # dependency of the enclosing function. The VALUE side only -- the assignment
         # TARGET is a new local binding, not a reference -- so the shared shadow guard
         # still holds (a param/local named on the RHS is the local, not the module fn).
-        if config.ts_module == "tree_sitter_python" and node.type == "assignment":
+        if _is_python and node.type == "assignment":
             enclosing_locals = local_bound_names.get(caller_nid, frozenset()) | extra_locals
             for ident in _python_ref_value_idents(node.child_by_field_name("right")):
                 _emit_indirect_ref(ident, caller_nid, enclosing_locals, "assignment")
-        elif config.ts_module == "tree_sitter_python" and node.type == "return_statement":
+        elif _is_python and node.type == "return_statement":
             enclosing_locals = local_bound_names.get(caller_nid, frozenset()) | extra_locals
             value = next((c for c in node.children if c.is_named), None)
             for ident in _python_ref_value_idents(value):
@@ -5774,7 +5796,7 @@ def _extract_generic(
         # fold it into extra_locals for that subtree only — same shape as the untracked
         # closure fold above (#2241) — leaving references outside the block resolvable.
         if (
-            config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript")
+            _is_js_family
             and node.type == "catch_clause"
         ):
             param = node.child_by_field_name("parameter")  # absent for ES2019 `catch {}`
@@ -5786,7 +5808,7 @@ def _extract_generic(
         for child in node.children:
             walk_calls(child, caller_nid, receiver_types, extra_locals)
 
-    if config.ts_module == "tree_sitter_ruby":
+    if _is_ruby:
         for caller_nid, body_node in function_bodies:
             ruby_var_types[caller_nid] = _ruby_local_class_bindings(body_node, source)
 
@@ -5794,14 +5816,14 @@ def _extract_generic(
     # every function body so the cross-file member-call pass can type a receiver
     # (#1547). File-scoped (not per-body): a later body's `Foo f;` doesn't clobber
     # an earlier binding (`var not in table`), keeping resolution conservative.
-    if config.ts_module == "tree_sitter_cpp":
+    if _is_cpp:
         for _caller_nid, body_node in function_bodies:
             _cpp_local_var_types(body_node, source, type_table)
 
     # Swift: type local `let x = Type()` / `let x = Type.shared` bindings inside
     # method bodies so `x.method()` on a later line resolves — class-level
     # properties are typed in the walk, but method-body locals were not (#1604).
-    if config.ts_module == "tree_sitter_swift":
+    if _is_swift:
         for _caller_nid, body_node in function_bodies:
             _swift_local_var_types(body_node, source, type_table,
                                    factory=swift_factory_bindings)
@@ -5860,7 +5882,7 @@ def _extract_generic(
     # to the file node. Function and class bodies are walked above, so this scan
     # stops at their boundaries — it must not re-attribute a method's local table
     # to the file, and class-attribute tables are a later refinement.
-    if config.ts_module == "tree_sitter_python":
+    if _is_python:
         module_bound = _python_module_bound_names(root, source)
 
         def _scan_module_dispatch(n) -> None:
@@ -5884,7 +5906,7 @@ def _extract_generic(
                 _scan_module_dispatch(c)
 
         _scan_module_dispatch(root)
-    elif config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
+    elif _is_js_family:
         js_module_bound = _js_module_bound_names(root, source)
 
         def _scan_js_module_dispatch(n) -> None:
@@ -5933,7 +5955,7 @@ def _extract_generic(
     # Kotlin (#2526/#2550): the declared package qualifies every node in the
     # file; the import-target and qualified-call resolvers key their per-package
     # symbol indexes off it.
-    if config.ts_module == "tree_sitter_kotlin":
+    if _is_kotlin:
         _pkg = _kotlin_package_name(root, source)
         if _pkg:
             result["kotlin_package"] = _pkg
@@ -5958,9 +5980,9 @@ def _extract_generic(
     # a call on a typed param (incl. inside a closure) resolve (#1630). The
     # constructor-injection entries are populated during the walk above and win on
     # a name clash (first-binding-wins in the helper).
-    if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
+    if _is_js_family:
         _ts_receiver_type_table(root, source, type_table)
-    if config.ts_module == "tree_sitter_swift":
+    if _is_swift:
         if type_table or swift_factory_bindings:
             result["swift_type_table"] = {"path": str_path, "table": type_table}
             if swift_factory_bindings:
@@ -5969,9 +5991,9 @@ def _extract_generic(
                     k: list(v) for k, v in swift_factory_bindings.items()
                 }
     elif type_table:
-        if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
+        if _is_js_family:
             result["ts_type_table"] = {"path": str_path, "table": type_table}
-        elif config.ts_module == "tree_sitter_cpp":
+        elif _is_cpp:
             result["cpp_type_table"] = {"path": str_path, "table": type_table}
     return result
 
