@@ -29,6 +29,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+mod ids;
 mod languages;
 
 /// Why a file was deferred to the Python extractor. Returned to Python so the
@@ -107,11 +108,28 @@ fn selftest<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
     Ok(out)
 }
 
+/// Differential-test hooks. Exposed so the id primitives can be compared against
+/// `graphify.ids.make_id` over real corpora rather than trusted from unit tests
+/// -- these are the foundation every node and edge id is built on, so a
+/// disagreement here would corrupt everything downstream silently.
+#[pyfunction]
+fn debug_make_id(parts: Vec<String>) -> Option<String> {
+    let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+    ids::make_id_ascii(&refs)
+}
+
+#[pyfunction]
+fn debug_file_stem(path: &str) -> Option<String> {
+    ids::file_stem(path)
+}
+
 #[pymodule]
 fn graphify_kernel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(supported_languages, m)?)?;
     m.add_function(wrap_pyfunction!(extract_file, m)?)?;
     m.add_function(wrap_pyfunction!(selftest, m)?)?;
+    m.add_function(wrap_pyfunction!(debug_make_id, m)?)?;
+    m.add_function(wrap_pyfunction!(debug_file_stem, m)?)?;
     Ok(())
 }
