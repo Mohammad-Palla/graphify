@@ -23,11 +23,15 @@ pub type Walker = for<'py> fn(Python<'py>, &str, &[u8]) -> PyResult<Option<Bound
 /// accounting are correct, and any later parity failure is the walker's fault
 /// alone. Starting with a half-finished TypeScript walker would confound the two.
 pub fn supported() -> Vec<&'static str> {
+    // Not yet gated: parity must show DIVERGENT=0 on a real corpus first.
     Vec::new()
 }
 
-pub fn walker_for(_language: &str) -> Option<Walker> {
-    None
+pub fn walker_for(language: &str) -> Option<Walker> {
+    match language {
+        "typescript" => Some(crate::typescript::walk),
+        _ => None,
+    }
 }
 
 /// Parse a trivial TypeScript source to prove the grammar is linked and

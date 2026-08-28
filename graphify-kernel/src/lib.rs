@@ -31,6 +31,7 @@ use pyo3::types::{PyDict, PyList};
 
 mod ids;
 mod languages;
+mod typescript;
 
 /// Why a file was deferred to the Python extractor. Returned to Python so the
 /// parity harness can report *which* gap dominates, not just that one exists.
