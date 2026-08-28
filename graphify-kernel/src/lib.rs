@@ -30,29 +30,27 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 mod ids;
+mod js;
 mod languages;
-mod typescript;
 
-/// Why a file was deferred to the Python extractor. Returned to Python so the
-/// parity harness can report *which* gap dominates, not just that one exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Defer {
-    /// No native walker is registered for this language at all.
-    UnsupportedLanguage,
-    /// The grammar reported an error node; Python's recovery is authoritative.
-    ParseError,
-    /// A node type this walker has no byte-identical rule for.
-    UnhandledConstruct,
+/// A walker's verdict on one file: a finished result, or a deferral *with the
+/// reason*.
+///
+/// The reason is the whole point. A walker that defers is correct but buys
+/// nothing, and without a reason the only visible signal is a percentage --
+/// which tells you that a gap exists but never which one, so the next construct
+/// to implement has to be guessed. `&'static str` because every reason is either
+/// a literal or a tree-sitter node kind, which the grammar already owns for the
+/// life of the process: naming a gap costs no allocation, so the production path
+/// pays nothing for being explainable.
+pub enum Outcome<'py> {
+    Native(Bound<'py, PyDict>),
+    Defer(&'static str),
 }
 
-impl Defer {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Defer::UnsupportedLanguage => "unsupported_language",
-            Defer::ParseError => "parse_error",
-            Defer::UnhandledConstruct => "unhandled_construct",
-        }
-    }
+/// Shorthand for the deferral arm, so a walker reads `return defer("kind:x")`.
+pub fn defer<'py>(reason: &'static str) -> PyResult<Outcome<'py>> {
+    Ok(Outcome::Defer(reason))
 }
 
 /// The kernel's own version, independent of Graphify's. Bumped whenever the
@@ -72,25 +70,38 @@ fn supported_languages() -> Vec<&'static str> {
     languages::supported()
 }
 
-/// Extract one file natively, or return `None` to defer to Python.
+/// Extract one file natively. Returns `(result, defer_reason)` -- exactly one of
+/// which is non-None.
+///
+/// The reason travels with the deferral rather than being derivable from it,
+/// because the two callers need different things from the same call and neither
+/// should have to re-derive it: `kernel.try_extract` tallies reasons so a pooled
+/// build can print a breakdown, and the parity harness ranks them to pick the
+/// next construct to implement. Returning a bare `None` made both of those
+/// guesswork.
 ///
 /// `source` is the file's raw bytes -- not a `str`. Graphify's Python extractors
 /// read bytes and hand them to tree-sitter unchanged, and a lossy decode would
 /// shift every byte offset in the file, so the boundary is bytes on both sides.
+///
+/// `resolve_import` is a callable `(specifier) -> tuple | None` wrapping
+/// `_resolve_js_import_target`. Omitting it does not disable imports -- it makes
+/// any file containing one defer, since resolution has no safe default.
 #[pyfunction]
-#[pyo3(signature = (path, source, language))]
+#[pyo3(signature = (path, source, language, resolve_import=None))]
 fn extract_file<'py>(
     py: Python<'py>,
     path: &str,
     source: &[u8],
     language: &str,
-) -> PyResult<Option<Bound<'py, PyDict>>> {
+    resolve_import: Option<Bound<'py, PyAny>>,
+) -> PyResult<(Option<Bound<'py, PyDict>>, Option<&'static str>)> {
+    let res = js::imports::Resolver::new(resolve_import);
     match languages::walker_for(language) {
-        None => Ok(None),
-        Some(walker) => match walker(py, path, source) {
-            Ok(Some(result)) => Ok(Some(result)),
-            Ok(None) => Ok(None),
-            Err(err) => Err(err),
+        None => Ok((None, Some("no_walker"))),
+        Some(walker) => match walker(py, path, source, &res)? {
+            Outcome::Native(result) => Ok((Some(result), None)),
+            Outcome::Defer(reason) => Ok((None, Some(reason))),
         },
     }
 }
@@ -106,6 +117,14 @@ fn selftest<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
     out.set_item("languages", PyList::new(py, languages::supported())?)?;
     // Prove the tree-sitter link is live, not just that the module loaded.
     out.set_item("tree_sitter_ok", languages::grammar_smoke_test())?;
+    // language -> (abi_version, node_kind_count, field_count), so `kernel.py` can
+    // refuse any language whose grammar does not match the one Python loads. See
+    // `languages::grammar_fingerprints` for why this is not optional.
+    let fps = PyDict::new(py);
+    for (name, abi, kinds, fields) in languages::grammar_fingerprints() {
+        fps.set_item(name, (abi, kinds, fields))?;
+    }
+    out.set_item("grammars", fps)?;
     Ok(out)
 }
 
@@ -124,6 +143,22 @@ fn debug_file_stem(path: &str) -> Option<String> {
     ids::file_stem(path)
 }
 
+/// Panic on purpose, so the seam's crash containment can be tested against a REAL
+/// Rust panic rather than a stand-in.
+///
+/// This matters because of a detail that is easy to get wrong: PyO3 turns a panic
+/// into `pyo3_runtime.PanicException`, which derives from `BaseException`, NOT
+/// `Exception`. A `try/except Exception` around the call therefore does not catch
+/// it, and the panic escapes through `_safe_extract` (also `except Exception`) and
+/// out of the pool worker, where `ProcessPoolExecutor` surfaces it as a failure
+/// for every file that worker was holding. One malformed file would take out a
+/// batch. The contract is that a native failure is a deferral, so this is
+/// exercised rather than assumed.
+#[pyfunction]
+fn debug_panic() -> PyResult<()> {
+    panic!("deliberate panic from graphify_kernel::debug_panic");
+}
+
 #[pymodule]
 fn graphify_kernel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
@@ -132,5 +167,6 @@ fn graphify_kernel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(selftest, m)?)?;
     m.add_function(wrap_pyfunction!(debug_make_id, m)?)?;
     m.add_function(wrap_pyfunction!(debug_file_stem, m)?)?;
+    m.add_function(wrap_pyfunction!(debug_panic, m)?)?;
     Ok(())
 }
