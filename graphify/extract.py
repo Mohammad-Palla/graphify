@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 from typing import Any, Callable
 
+from graphify.extractors import kernel as _kernel_seam
 from .cache import load_cached, save_cached
 from .mcp_ingest import extract_mcp_config, is_mcp_config_path
 from .manifest_ingest import extract_package_manifest, is_package_manifest_path
@@ -178,6 +179,58 @@ _EXTRACT_PROFILE = os.environ.get("GRAPHIFY_EXTRACT_PROFILE") == "1"
 
 def _prof_print(label: str, value: str) -> None:
     print(f"[graphify extract-profile] {label}: {value}", flush=True)
+
+
+# ── Native-kernel accounting ──────────────────────────────────────────────────
+# `kernel._counts` lives in whichever process ran the walker, and extraction runs
+# in `ProcessPoolExecutor` workers that are discarded without a hook to read them
+# on exit. So each worker drains its tally per file and ships it back with the
+# result; the parent sums it here and prints one line per `AST extract` stage.
+#
+# This is a prerequisite for routing ANY language natively, not a nicety. A walker
+# that is correct but quietly defers most files reports DIVERGENT=0 while
+# delivering none of the speedup, and without this channel a pooled build has no
+# way to say so.
+_KERNEL_TALLY: Counter = Counter()
+
+
+def _kernel_counts() -> dict[str, float]:
+    """This file's kernel tallies, prefixed to keep them out of the timing channel.
+
+    Returns `{}` when no language is routed, which is the overwhelmingly common
+    case and must stay free: `drain_counts` short-circuits on an empty counter.
+    """
+    try:
+        return {f"kernel:{k}": float(v) for k, v in _kernel_seam.drain_counts().items()}
+    except Exception:
+        return {}
+
+
+def _report_kernel_tally() -> None:
+    """One line naming the native rate and the deferral reasons behind it.
+
+    Printed whenever anything was routed -- not gated on the profile env var,
+    because the deferral RATE is the number that says whether the native path is
+    doing any work, and a normal build should not have to be re-run under a
+    diagnostic flag to see it.
+    """
+    if not _KERNEL_TALLY:
+        return
+    native = sum(v for k, v in _KERNEL_TALLY.items() if k.startswith("native:"))
+    deferred = sum(v for k, v in _KERNEL_TALLY.items() if k.startswith("defer:"))
+    total = native + deferred
+    reasons = sorted(
+        ((k.split(":", 1)[1], v) for k, v in _KERNEL_TALLY.items() if k.startswith("defer:")),
+        key=lambda kv: -kv[1],
+    )
+    shown = ", ".join(f"{name} {count}" for name, count in reasons[:6])
+    more = f", +{len(reasons) - 6} more" if len(reasons) > 6 else ""
+    print(
+        f"  kernel: {native} native ({native / max(total, 1) * 100:.1f}%), "
+        f"{deferred} deferred" + (f" [{shown}{more}]" if reasons else ""),
+        flush=True,
+    )
+    _KERNEL_TALLY.clear()
 
 
 class _MarkTimer:
@@ -5524,7 +5577,7 @@ def _safe_extract_with_xaml_root(extractor, path: Path, root: Path) -> dict:
         _XAML_ACTIVE_EXTRACT_ROOT = previous_root
 
 
-def _extract_single_file(args: tuple) -> tuple[int, dict]:
+def _extract_single_file(args: tuple) -> tuple[int, dict] | tuple[int, dict, dict]:
     """Worker function for parallel extraction. Runs in a subprocess.
 
     Must be at module level (not a closure) so it can be pickled by
@@ -5569,7 +5622,9 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
         # through the file (#1666); skipping the write lets a rerun self-heal.
         if not bypass_cache and "error" not in result and result.get("nodes"):
             save_cached(path, result, root, cache_root=cache_location)
-        return idx, result
+        # Third element: the worker's kernel tally, drained per file because there
+        # is no worker-exit hook -- see `_KERNEL_TALLY`.
+        return idx, result, _kernel_counts()
 
     # ── profiled path (GRAPHIFY_EXTRACT_PROFILE=1) ───────────────────────────
     # Same control flow, timed per segment. `t` is returned as a THIRD tuple
@@ -5602,6 +5657,7 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
         _t0 = _pc()
         save_cached(path, result, root, cache_root=cache_location)
         t["cache_write"] = _pc() - _t0
+    t.update(_kernel_counts())
     return idx, result, t
 
 
@@ -5691,7 +5747,10 @@ def _extract_parallel(
                     per_file[idx] = result
                     if len(_res) > 2:
                         for _k, _v in _res[2].items():
-                            _wsum[_k] = _wsum.get(_k, 0.0) + _v
+                            if _k.startswith("kernel:"):
+                                _KERNEL_TALLY[_k[7:]] += int(_v)
+                            else:
+                                _wsum[_k] = _wsum.get(_k, 0.0) + _v
                 except concurrent.futures.process.BrokenProcessPool:
                     # #2444: a pool that dies while results are being consumed
                     # raises BrokenProcessPool from every pending future. It
@@ -5800,6 +5859,9 @@ def _extract_sequential(
         if not bypass_cache and "error" not in result and result.get("nodes"):
             save_cached(path, result, root, cache_root=cache_location)
         per_file[idx] = result
+    # In-process, so the counters are already here -- no ferrying needed.
+    for _k, _v in _kernel_counts().items():
+        _KERNEL_TALLY[_k[7:]] += int(_v)
     if total_files >= _PROGRESS_INTERVAL:
         # Consistent denominator with the intermediate lines (#1693).
         _done = len(uncached_work)
@@ -5958,6 +6020,8 @@ def extract(
                 [(i, p) for (i, p) in uncached_work if per_file[i] is None],
                 per_file, root, total, cache_location,
             )
+
+    _report_kernel_tally()
 
     if _EXTRACT_PROFILE:
         _prof_print("phase2_extract", f"{time.perf_counter() - _p_t0:.1f}s  (pool or sequential)")
