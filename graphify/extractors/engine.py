@@ -5,6 +5,7 @@ import hashlib
 import importlib
 from graphify.extractors.base import _LANGUAGE_BUILTIN_GLOBALS, _file_stem, _make_id, _read_text
 from graphify.ids import normalize_id
+from graphify.extractors import kernel as _kernel
 from graphify.extractors.models import LanguageConfig
 from graphify.extractors.resolution import _resolve_js_import_target
 from graphify.security import sanitize_metadata
@@ -2875,6 +2876,15 @@ def _extract_generic(
     still keying nodes/edges off ``path``. Lets container formats (e.g. Vue SFCs)
     mask the wrapper and parse just the embedded ``<script>``.
     """
+    # Native kernel first, if one is built AND parity-gated for this grammar.
+    # This is the whole native seam: one call, at the single point every language
+    # funnels through, returning None for "not mine -- carry on". It is placed
+    # above the grammar import because a routed language must not pay for loading
+    # the Python grammar it will not use. `try_extract` never raises and never
+    # reads the file unless it is actually going to handle it.
+    _native = _kernel.try_extract(path, config, source_override)
+    if _native is not None:
+        return _native
     try:
         mod = importlib.import_module(config.ts_module)
         from tree_sitter import Language, Parser

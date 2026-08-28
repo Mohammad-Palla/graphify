@@ -1,0 +1,22 @@
+[package]
+name = "graphify-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "Native per-file AST extraction core for Graphify"
+license = "MIT"
+
+[lib]
+name = "graphify_kernel"
+crate-type = ["cdylib"]
+
+[dependencies]
+# abi3-py310: one wheel for every CPython >= 3.10, matching Graphify's floor.
+pyo3 = { version = "0.23", features = ["abi3-py310", "extension-module"] }
+tree-sitter = "0.25"
+tree-sitter-typescript = "0.23"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "unwind"
