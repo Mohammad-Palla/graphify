@@ -6826,11 +6826,19 @@ def extract(
     # (test/non-test classification + path proximity). Kept separate from the
     # file-node-id map because tie-breaking compares the actual file paths.
     nid_to_source_file: dict[str, str] = {}
+    # nid -> interop language family, derived once here rather than per candidate
+    # occurrence. The cross-language guard below runs over every candidate of
+    # every raw_call, so calling _lang_family() there is O(sum |candidates|)
+    # -- on Bun ~18% of the whole tail -- while the answer only ever depends on
+    # the node, of which there are |nodes|. Same values, computed once each.
+    nid_to_family: dict[str, str | None] = {}
     for n in resolution_nodes:
         sf = n.get("source_file")
         if not sf:
             continue
-        nid_to_source_file[n["id"]] = str(sf)
+        sf_str = str(sf)
+        nid_to_source_file[n["id"]] = sf_str
+        nid_to_family[n["id"]] = _lang_family(sf_str)
         fnid = sf_to_file_nid.get(str(sf))
         if fnid is not None:
             nid_to_file_nid[n["id"]] = fnid
@@ -6913,7 +6921,7 @@ def extract(
         if caller_family is not None:
             candidates = [
                 c for c in candidates
-                if (candidate_family := _lang_family(nid_to_source_file.get(c))) is None
+                if (candidate_family := nid_to_family.get(c)) is None
                 or candidate_family == caller_family
             ]
             if not candidates:
