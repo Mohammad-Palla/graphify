@@ -312,7 +312,13 @@ def disambiguate_ambiguous_candidates(
 
     call_is_test = _is_test_path(call_site_file)
     test_cands = [c for c in candidates if _is_test_path(candidate_files.get(c, ""))]
-    nontest_cands = [c for c in candidates if c not in set(test_cands)]
+    # Bind the set once. Inlining `set(test_cands)` in the comprehension rebuilt
+    # it for every candidate, making this O(k^2) in the candidate count -- and the
+    # names that reach this tie-breaker at all are precisely the ambiguous ones
+    # with the longest candidate lists (`log`, `get`, `test`). On Bun that single
+    # line was 71% of the cross-file call pass. Membership semantics unchanged.
+    test_set = set(test_cands)
+    nontest_cands = [c for c in candidates if c not in test_set]
 
     if call_is_test:
         # Prefer a test-local definition (same file) first.
