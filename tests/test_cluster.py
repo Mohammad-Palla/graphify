@@ -177,3 +177,151 @@ def test_partition_is_invariant_to_edge_endpoint_orientation():
     assert _grouping(_partition(forward, 1.0)) == _grouping(_partition(flipped, 1.0)), (
         "partition drifted with edge-endpoint orientation / insertion order"
     )
+
+
+# ── _partition's edge ordering ────────────────────────────────────────────────
+#
+# `_partition` sorts every edge to fix a deterministic order before handing the
+# graph to the partitioner (see the #1090 comment: an unstable order changed the
+# cohesion-split pass from 70 communities to 69 under a different hash seed). The
+# sort key used to end in a `json.dumps` of the edge attributes, computed for
+# every edge -- 335,986 encodes and 1.4s of superset's 12.0s profiled `cluster`,
+# for a tiebreaker that on an undirected simple graph can never be reached.
+#
+# It IS reachable on a DiGraph, so it is now computed only for canonical pairs
+# that actually repeat. These pin that the ordering is unchanged either way.
+
+def _reference_edge_rows(G):
+    """The pre-optimization key: canonical pair, then always the attribute dump."""
+    import json
+    return sorted(
+        G.edges(data=True),
+        key=lambda row: (
+            *sorted((str(row[0]), str(row[1]))),
+            json.dumps(row[2], sort_keys=True, ensure_ascii=False, default=str),
+        ),
+    )
+
+
+def _partition_edge_rows(G):
+    """`_partition`'s ordering, extracted by capturing what it feeds the graph."""
+    import networkx as nx
+    import graphify.cluster as cl
+    captured = []
+    real_add_edge = nx.Graph.add_edge
+
+    def spy(self, u, v, **attrs):
+        captured.append((u, v, attrs))
+        return real_add_edge(self, u, v, **attrs)
+
+    nx.Graph.add_edge = spy
+    try:
+        cl._partition(G)
+    finally:
+        nx.Graph.add_edge = real_add_edge
+    return captured
+
+
+def _same_order(a, b):
+    return [(str(u), str(v)) for u, v, _ in a] == [(str(u), str(v)) for u, v, _ in b]
+
+
+def _same_pairs(a, b):
+    """Compare the CANONICAL pair sequence, ignoring each row's orientation.
+
+    `_partition` sorts on the canonical pair but hands `add_edge` the row's
+    original orientation, and for an undirected graph that carries no meaning --
+    the nodes are pre-added in sorted order, so (a, c) and (c, a) build the same
+    `stable`. The invariant is the sequence of pairs, not of orientations."""
+    key = lambda rows: [tuple(sorted((str(u), str(v)))) for u, v, _ in rows]
+    return key(a) == key(b)
+
+
+def test_partition_edge_order_matches_the_reference_key_on_an_undirected_graph():
+    import networkx as nx
+    G = nx.Graph()
+    for u, v, w in [("b", "a", 1.0), ("a", "c", 2.0), ("z", "a", 1.0),
+                    ("c", "b", 3.0), ("m", "n", 1.0)]:
+        G.add_edge(u, v, weight=w, kind="calls")
+    assert _same_order(_partition_edge_rows(G), _reference_edge_rows(G))
+
+
+def test_partition_edge_order_is_independent_of_insertion_order():
+    """The whole point of the sort (#1090): the same edge set must produce the
+    same order however adjacency iteration happened to yield it."""
+    import networkx as nx
+    edges = [("b", "a", 1.0), ("a", "c", 2.0), ("z", "a", 1.0), ("c", "b", 3.0)]
+    G1, G2 = nx.Graph(), nx.Graph()
+    for u, v, w in edges:
+        G1.add_edge(u, v, weight=w)
+    for u, v, w in reversed(edges):
+        G2.add_edge(v, u, weight=w)
+    assert _same_pairs(_partition_edge_rows(G1), _partition_edge_rows(G2))
+
+
+def test_attribute_tiebreaker_still_orders_a_colliding_canonical_pair():
+    """A DiGraph yields (A, B) and (B, A) as two rows that collide once
+    canonicalised -- exactly the case the dump exists for. It must still be
+    applied there, and must still agree with the reference key."""
+    import networkx as nx
+    G = nx.DiGraph()
+    G.add_edge("a", "b", weight=1.0, kind="zzz")
+    G.add_edge("b", "a", weight=1.0, kind="aaa")
+    G.add_edge("c", "d", weight=1.0, kind="mmm")
+    rows = _partition_edge_rows(G)
+    ref = _reference_edge_rows(G)
+    assert _same_order(rows, ref)
+    # The colliding pair is ordered by the dump, so "aaa" precedes "zzz".
+    ab = [r for r in rows if {str(r[0]), str(r[1])} == {"a", "b"}]
+    assert [r[2]["kind"] for r in ab] == ["aaa", "zzz"]
+
+
+def test_partition_is_deterministic_across_repeated_calls():
+    import networkx as nx
+    G = nx.Graph()
+    for i in range(40):
+        G.add_edge(f"n{i}", f"n{(i * 7) % 40}", weight=1.0)
+    from graphify.cluster import _partition
+    assert _partition(G) == _partition(G)
+
+
+def test_no_attribute_dump_is_computed_for_an_undirected_graph(monkeypatch):
+    """Pins the optimization, not just its neutrality.
+
+    Every other test here would still pass if the dump were computed for every
+    edge -- that is the old behaviour, which was correct, just 335,986 encodes
+    and 1.4s of superset's `cluster`. Only counting the calls catches a silent
+    regression to it.
+    """
+    import json as _json
+    import networkx as nx
+    import graphify.cluster as cl
+
+    calls = []
+    real_dumps = _json.dumps
+    monkeypatch.setattr(cl.json, "dumps",
+                        lambda *a, **k: (calls.append(1), real_dumps(*a, **k))[1])
+    G = nx.Graph()
+    for i in range(30):
+        G.add_edge(f"n{i}", f"n{(i * 11) % 30}", weight=1.0, kind="calls")
+    cl._partition(G)
+    assert calls == [], f"{len(calls)} attribute dumps on an undirected graph"
+
+
+def test_the_dump_is_computed_only_for_the_colliding_rows(monkeypatch):
+    """On a DiGraph only the rows whose canonical pair repeats need it."""
+    import json as _json
+    import networkx as nx
+    import graphify.cluster as cl
+
+    calls = []
+    real_dumps = _json.dumps
+    monkeypatch.setattr(cl.json, "dumps",
+                        lambda *a, **k: (calls.append(1), real_dumps(*a, **k))[1])
+    G = nx.DiGraph()
+    G.add_edge("a", "b", weight=1.0)   # collides with (b, a)
+    G.add_edge("b", "a", weight=1.0)
+    for i in range(20):                # 20 rows that cannot collide
+        G.add_edge(f"x{i}", f"y{i}", weight=1.0)
+    cl._partition(G)
+    assert len(calls) == 2, f"expected 2 dumps for the one colliding pair, got {len(calls)}"

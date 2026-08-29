@@ -106,8 +106,7 @@ def _partition(G: nx.Graph, resolution: float = 1.0) -> dict[str, int]:
     Output from graspologic is suppressed to prevent ANSI escape codes
     from corrupting terminal scroll buffers on Windows PowerShell 5.1.
     """
-    stable = nx.Graph()
-    stable.add_nodes_from(sorted(G.nodes(), key=str))
+    sorted_nodes = sorted(G.nodes(), key=str)
     # Canonicalise the endpoint pair before sorting. On an undirected graph the
     # (u, v) orientation each edge is yielded with comes from adjacency
     # iteration, which follows CPython's per-process string-hash order - so the
@@ -119,13 +118,49 @@ def _partition(G: nx.Graph, resolution: float = 1.0) -> dict[str, int]:
     # first-pass partition, but the cohesion-split pass produced 70 communities
     # under PYTHONHASHSEED=1 and 69 under =2. Sorting the pair itself removes
     # the dependency; for nx.Graph the orientation carries no meaning anyway.
-    edge_rows = sorted(
-        G.edges(data=True),
-        key=lambda row: (
-            *sorted((str(row[0]), str(row[1]))),
-            json.dumps(row[2], sort_keys=True, ensure_ascii=False, default=str),
-        ),
-    )
+    #
+    # The attribute dump is a TIEBREAKER for two rows sharing a canonical pair,
+    # and on an undirected simple graph that cannot happen -- at most one edge
+    # exists per unordered pair, so the pair alone already totally orders the
+    # rows and the dump is computed for every edge and never once consulted. It
+    # measured 335,986 `json.dumps` calls and 1.4s of superset's 12.0s profiled
+    # `cluster`, for a comparison that never runs.
+    #
+    # It is not dead in general: `cluster` is public and a DiGraph yields (A, B)
+    # and (B, A) as two distinct rows that DO collide once canonicalised. So the
+    # dump is still computed -- only for rows whose canonical pair actually
+    # repeats. Groups are disjoint by construction (a duplicated pair's rows
+    # share the first two key components and no others reach them), so the ""
+    # placeholder is never compared against a real dump.
+    rows = list(G.edges(data=True))
+    pairs = [tuple(sorted((str(r[0]), str(r[1])))) for r in rows]
+    seen: set = set()
+    dup = {pr for pr in pairs if pr in seen or seen.add(pr)}
+    edge_rows = [
+        r for _, r in sorted(
+            zip(pairs, rows),
+            # key= only, never a bare tuple compare: `rows` holds attribute
+            # dicts, and two colliding keys would make sorted() try to order
+            # dicts and raise TypeError.
+            key=lambda t: (
+                t[0],
+                json.dumps(t[1][2], sort_keys=True, ensure_ascii=False, default=str)
+                if t[0] in dup else "",
+            ),
+        )
+    ]
+    # DO NOT hand `edge_rows` straight to the native call to skip this rebuild.
+    # It looks like pure waste -- `gn.leiden` takes a plain edge list, so
+    # on the native path this graph is a full second copy that nothing reads AS a
+    # graph (335,986 `add_edge` calls and a second complete edge walk on
+    # superset). It is not waste: `stable.edges()` yields in node-sorted, then
+    # adjacency-insertion order, which is NOT `edge_rows` order, and Leiden is
+    # sensitive to the order its edge list arrives in. Measured -- feeding
+    # `edge_rows` directly held nodes and edges byte-identical but moved the
+    # partition: community ARI 0.6886 on django, 0.8489 on vue, 0.9170 on gin.
+    # This graph is what fixes the order the partitioner sees.
+    stable = nx.Graph()
+    stable.add_nodes_from(sorted_nodes)
     for src, tgt, attrs in edge_rows:
         stable.add_edge(src, tgt, **attrs)
 
