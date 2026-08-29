@@ -143,6 +143,24 @@ fn debug_file_stem(path: &str) -> Option<String> {
     ids::file_stem(path)
 }
 
+/// Parse `source` and run ONE full-tree traversal over it, returning the tree's
+/// depth.
+///
+/// An attribution hook, not a feature. There is no native profiler on this box
+/// (`perf` and `valgrind` are absent, and `py-spy` sees a single opaque frame for
+/// the whole of `extract_file`), so the only way to find out what the native path
+/// spends its time on is to measure a part of it in isolation. This exposes the
+/// cheapest possible traversal -- the depth probe, which touches every node and
+/// does nothing else -- so its cost can be subtracted from parse and compared
+/// against a full extract. The walker performs roughly seven full-tree
+/// traversals per file, so one traversal's cost multiplied out is the size of the
+/// prize for making them cheaper.
+#[pyfunction]
+#[pyo3(signature = (source, language))]
+fn debug_traversal_cost(source: &[u8], language: &str) -> Option<u32> {
+    js::debug_traversal_cost(source, language)
+}
+
 /// Panic on purpose, so the seam's crash containment can be tested against a REAL
 /// Rust panic rather than a stand-in.
 ///
@@ -168,5 +186,6 @@ fn graphify_kernel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(debug_make_id, m)?)?;
     m.add_function(wrap_pyfunction!(debug_file_stem, m)?)?;
     m.add_function(wrap_pyfunction!(debug_panic, m)?)?;
+    m.add_function(wrap_pyfunction!(debug_traversal_cost, m)?)?;
     Ok(())
 }

@@ -225,6 +225,20 @@ impl<'a, 'tree> Ctx<'a, 'tree> {
     }
 }
 
+/// Parse and run exactly one full-tree traversal. See `lib.rs::debug_traversal_cost`.
+pub fn debug_traversal_cost(source: &[u8], language: &str) -> Option<u32> {
+    let lang: tree_sitter::Language = match language {
+        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        "tsx" => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        _ => return None,
+    };
+    let mut parser = Parser::new();
+    parser.set_language(&lang).ok()?;
+    let tree = parser.parse(source, None)?;
+    Some(tree_depth(tree.root_node()))
+}
+
 /// The entry points registered in `languages::walker_for`.
 ///
 /// One walker, three grammars. `.tsx` needs its own grammar rather than the plain
