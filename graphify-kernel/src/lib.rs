@@ -32,6 +32,7 @@ use pyo3::types::{PyDict, PyList};
 mod ids;
 mod js;
 mod languages;
+mod py;
 
 /// A walker's verdict on one file: a finished result, or a deferral *with the
 /// reason*.
@@ -51,6 +52,20 @@ pub enum Outcome<'py> {
 /// Shorthand for the deferral arm, so a walker reads `return defer("kind:x")`.
 pub fn defer<'py>(reason: &'static str) -> PyResult<Outcome<'py>> {
     Ok(Outcome::Defer(reason))
+}
+
+/// Every language's Python-side resolver, handed to whichever walker runs.
+///
+/// One bundle rather than a per-language parameter because [`languages::Walker`]
+/// is a single fn-pointer type: making the resolver type vary per language would
+/// need either an enum at the dispatch point or a registry per language, and the
+/// registry being ONE table is what makes "which languages go native" answerable
+/// by reading one function. Construction is cheap -- each holds an `Option`
+/// callable and an empty memo -- so a walker paying for a bundle it half-ignores
+/// costs nothing measurable against a parse.
+pub struct Resolvers<'py> {
+    pub js: js::imports::Resolver<'py>,
+    pub py: py::imports::Resolver<'py>,
 }
 
 /// The kernel's own version, independent of Graphify's. Bumped whenever the
@@ -91,8 +106,16 @@ fn supported_languages() -> Vec<&'static str> {
 /// `resolve_module` is the same idea for `_resolve_js_module_path`, used only by
 /// the symbol-fact collector. Omitting it drops `js_symbol_facts` from the result
 /// (phase 3 then collects them in Python) but leaves nodes/edges native.
+///
+/// `resolve_py_import` is Python's RELATIVE-import resolution -- the `Path.parent`
+/// walk plus `_probe_python_module_candidate`'s filesystem probes. It is a THIRD
+/// parameter rather than a reuse of `resolve_import`, deliberately: the two
+/// callables answer different questions and return different shapes, and a slot
+/// whose meaning depends on `language` is exactly the kind of thing that goes
+/// silently wrong. Omitting it makes any Python file containing a relative import
+/// defer, since there is no safe default for where it points.
 #[pyfunction]
-#[pyo3(signature = (path, source, language, resolve_import=None, resolve_module=None))]
+#[pyo3(signature = (path, source, language, resolve_import=None, resolve_module=None, resolve_py_import=None))]
 fn extract_file<'py>(
     py: Python<'py>,
     path: &str,
@@ -100,8 +123,12 @@ fn extract_file<'py>(
     language: &str,
     resolve_import: Option<Bound<'py, PyAny>>,
     resolve_module: Option<Bound<'py, PyAny>>,
+    resolve_py_import: Option<Bound<'py, PyAny>>,
 ) -> PyResult<(Option<Bound<'py, PyDict>>, Option<&'static str>)> {
-    let res = js::imports::Resolver::new(resolve_import, resolve_module);
+    let res = Resolvers {
+        js: js::imports::Resolver::new(resolve_import, resolve_module),
+        py: py::imports::Resolver::new(resolve_py_import),
+    };
     match languages::walker_for(language) {
         None => Ok((None, Some("no_walker"))),
         Some(walker) => match walker(py, path, source, &res)? {

@@ -15,6 +15,10 @@ pyo3 = { version = "0.23", features = ["abi3-py310", "extension-module"] }
 tree-sitter = "0.25"
 tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.25"
+# Must match the Python side (tree-sitter-python 0.25.0, ABI 15, 274 kinds,
+# 32 fields). `languages::grammar_fingerprints` enforces it at load time --
+# see that function for the JS 0.23-vs-0.25 skew that motivated the check.
+tree-sitter-python = "0.25"
 
 [profile.release]
 opt-level = 3

@@ -203,12 +203,15 @@ def language_for(config: Any) -> str | None:
 _resolve_js_import_target: Callable | None = None
 _resolve_js_module_path: Callable | None = None
 _py_file_stem: Callable | None = None
+_probe_python_module: Callable | None = None
 
 
 def _bind_resolver_helpers() -> None:
     global _resolve_js_import_target, _resolve_js_module_path, _py_file_stem
+    global _probe_python_module
     if _resolve_js_import_target is not None:
         return
+    from graphify.extract import _probe_python_module_candidate
     from graphify.extractors.base import _file_stem
     from graphify.extractors.resolution import (
         _resolve_js_import_target as _r,
@@ -217,6 +220,7 @@ def _bind_resolver_helpers() -> None:
     _resolve_js_import_target = _r
     _resolve_js_module_path = _m
     _py_file_stem = _file_stem
+    _probe_python_module = _probe_python_module_candidate
 
 
 def _module_resolver(str_path: str) -> Callable[[str], str | None]:
@@ -276,6 +280,50 @@ def _import_resolver(str_path: str) -> Callable[[str], tuple | None]:
             "node_modules" in resolved_path.parts,
             file_stem(resolved_path),
         )
+
+    return _resolve
+
+
+def _py_import_resolver(str_path: str) -> Callable[[str], tuple]:
+    """A `(raw) -> (target_path_str, is_file)` callable for one Python file.
+
+    This is `_import_python`'s RELATIVE branch, lifted verbatim. The native walker
+    does the pure string work (an absolute `from pkg.mod import x` needs no
+    filesystem at all, so it never calls in here), and everything that touches
+    pathlib or disk happens on this side: the `.parent` walk for the leading dots,
+    the dotted-to-slash join, `_probe_python_module_candidate`'s
+    directory/`__init__.py`/file probes, the speculative fallback, and the final
+    `is_file()` that gates the `target_file` stamp.
+
+    Kept as a copy of the Python rather than a call into it because
+    `_import_python` emits edges as its output -- there is no seam in it that
+    returns just the resolution. The copy is byte-compared against the original by
+    `harness/kernel_walker_parity.py` on every `.py` file in the corpora, which is
+    what keeps it from drifting.
+    """
+    _bind_resolver_helpers()
+    probe = _probe_python_module
+    assert probe is not None
+    parent = Path(str_path).parent
+
+    def _resolve(raw: str) -> tuple:
+        dots = len(raw) - len(raw.lstrip("."))
+        module_name = raw.lstrip(".")
+        base = parent
+        for _ in range(dots - 1):
+            base = base.parent
+        candidate = base / module_name.replace(".", "/") if module_name else base
+        resolved = probe(candidate)
+        if resolved is not None:
+            target_path = resolved
+        else:
+            rel = (module_name.replace(".", "/") + ".py") if module_name else "__init__.py"
+            target_path = base / rel
+        try:
+            is_file = target_path.is_file()
+        except OSError:
+            is_file = False
+        return (str(target_path), is_file)
 
     return _resolve
 
@@ -390,6 +438,7 @@ def try_extract(path: Path, config: Any,
         result, reason = mod.extract_file(
             str_path, source, language,
             _import_resolver(str_path), _module_resolver(str_path),
+            _py_import_resolver(str_path),
         )
     except BaseException as exc:
         # BaseException, not Exception, and deliberately so.
@@ -421,6 +470,8 @@ def try_extract(path: Path, config: Any,
         return None
     if "js_symbol_facts" in result:
         _counts[f"native_facts:{language}"] += 1
+    if "py_rationale" in result:
+        _counts[f"native_rationale:{language}"] += 1
     _counts[f"native:{language}"] += 1
     return result
 

@@ -57,9 +57,14 @@ def _fake_kernel(*, languages=(), tree_sitter_ok=True, extract=None, version="0.
                             "tree_sitter_ok": tree_sitter_ok,
                             "grammars": dict(grammars)}
     # The real signature: `(result, defer_reason)`, exactly one of them non-None,
-    # plus the import-resolver callback the walker calls back into.
+    # plus the three resolver callbacks the walkers call back into (JS import, JS
+    # module, Python relative import). Pinned rather than `*args`: a stub that
+    # swallowed any arity would let the seam and the kernel drift apart silently,
+    # and the seam converts every TypeError into a deferral -- so the drift would
+    # show up as a quietly falling native rate, not a failure.
+    # `test_seam_calls_the_real_signature` asserts this matches the real module.
     mod.extract_file = (extract if extract is not None
-                        else (lambda p, s, l, r=None, m=None: (None, "fake")))
+                        else (lambda p, s, l, r=None, m=None, pr=None: (None, "fake")))
     return mod
 
 
@@ -159,7 +164,8 @@ def test_unknown_grammar_never_reaches_the_kernel(monkeypatch):
 def test_walker_exception_is_a_deferral_not_a_build_failure(monkeypatch, tmp_path):
     monkeypatch.delenv("GRAPHIFY_KERNEL", raising=False)
 
-    def _explode(path, source, language, resolve_import=None, resolve_module=None):
+    def _explode(path, source, language, resolve_import=None, resolve_module=None,
+                resolve_py_import=None):
         raise ValueError("walker bug")
 
     _install(monkeypatch, _fake_kernel(languages=("typescript",), extract=_explode))
@@ -174,7 +180,7 @@ def test_native_result_is_returned_and_counted(monkeypatch, tmp_path):
     payload = {"nodes": [{"id": "n"}], "edges": []}
     _install(monkeypatch, _fake_kernel(
         languages=("typescript",),
-        extract=lambda p, s, l, r=None, m=None: (payload, None)))
+        extract=lambda p, s, l, r=None, m=None, pr=None: (payload, None)))
     f = tmp_path / "a.ts"
     f.write_bytes(b"const x = 1;")
     assert kernel.try_extract(f, _Cfg()) is payload
@@ -186,7 +192,8 @@ def test_source_override_is_honoured(monkeypatch, tmp_path):
     monkeypatch.delenv("GRAPHIFY_KERNEL", raising=False)
     seen: dict = {}
 
-    def _capture(path, source, language, resolve_import=None, resolve_module=None):
+    def _capture(path, source, language, resolve_import=None, resolve_module=None,
+                 resolve_py_import=None):
         seen["source"] = source
         return ({"nodes": [], "edges": []}, None)
 
@@ -214,7 +221,8 @@ def test_real_rust_panic_is_a_deferral(monkeypatch, tmp_path):
         pytest.skip("kernel predates the debug_panic hook")
     monkeypatch.delenv("GRAPHIFY_KERNEL", raising=False)
 
-    def _panic(path, source, language, resolve_import=None, resolve_module=None):
+    def _panic(path, source, language, resolve_import=None, resolve_module=None,
+               resolve_py_import=None):
         real.debug_panic()
 
     _install(monkeypatch, _fake_kernel(languages=("typescript",), extract=_panic))
@@ -230,7 +238,8 @@ def test_interrupts_are_not_swallowed(monkeypatch, tmp_path, exc):
     responding to it (the defect fixed in d0edc4d)."""
     monkeypatch.delenv("GRAPHIFY_KERNEL", raising=False)
 
-    def _interrupt(path, source, language, resolve_import=None, resolve_module=None):
+    def _interrupt(path, source, language, resolve_import=None, resolve_module=None,
+                  resolve_py_import=None):
         raise exc()
 
     _install(monkeypatch, _fake_kernel(languages=("typescript",), extract=_interrupt))
@@ -246,7 +255,7 @@ def test_deferral_is_counted_by_reason(monkeypatch, tmp_path):
     monkeypatch.delenv("GRAPHIFY_KERNEL", raising=False)
     _install(monkeypatch, _fake_kernel(
         languages=("typescript",),
-        extract=lambda p, s, l, r=None, m=None: (None, "decorator")))
+        extract=lambda p, s, l, r=None, m=None, pr=None: (None, "decorator")))
     f = tmp_path / "a.ts"
     f.write_bytes(b"const x = 1;")
     assert kernel.try_extract(f, _Cfg()) is None
@@ -266,7 +275,8 @@ def test_grammar_mismatch_drops_the_language(monkeypatch, tmp_path):
     monkeypatch.delenv("GRAPHIFY_KERNEL", raising=False)
     called: list = []
 
-    def _extract(path, source, language, resolve_import=None, resolve_module=None):
+    def _extract(path, source, language, resolve_import=None, resolve_module=None,
+                 resolve_py_import=None):
         called.append(path)
         return ({"nodes": [], "edges": []}, None)
 
@@ -378,3 +388,27 @@ def test_extraction_is_identical_with_and_without_the_kernel(tmp_path):
     with_kernel.pop("js_symbol_facts", None)
     assert with_kernel == without_kernel
     assert with_kernel["nodes"], "fixture should produce nodes"
+
+
+def test_seam_calls_the_real_signature():
+    """The stubs above pin `extract_file`'s arity; this pins them to REALITY.
+
+    `try_extract` wraps the call in `except BaseException` and turns any failure
+    into a deferral, so calling the real kernel with the wrong number of arguments
+    does not raise -- it silently defers every file and the only symptom is a
+    native rate that quietly drops to zero. The stub tests cannot catch that,
+    because they stub the thing that would disagree. So probe the real module.
+    """
+    kernel_mod = pytest.importorskip("graphify_kernel",
+                                     reason="native kernel not built")
+    from graphify.extractors import kernel as seam
+    src = b"const x = 1;\n"
+    result, reason = kernel_mod.extract_file(
+        "/tmp/probe.ts", src, "typescript",
+        seam._import_resolver("/tmp/probe.ts"),
+        seam._module_resolver("/tmp/probe.ts"),
+        seam._py_import_resolver("/tmp/probe.ts"),
+    )
+    assert (result is None) != (reason is None), (
+        "extract_file must return exactly one of (result, reason)"
+    )

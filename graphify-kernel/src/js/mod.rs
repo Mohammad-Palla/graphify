@@ -252,30 +252,30 @@ pub fn walk_typescript<'py>(
     py: Python<'py>,
     path: &str,
     source: &[u8],
-    resolver: &Resolver<'py>,
+    res: &crate::Resolvers<'py>,
 ) -> PyResult<Outcome<'py>> {
     let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
-    finish(extract(py, path, source, resolver, &lang, Dialect::TypeScript))
+    finish(extract(py, path, source, &res.js, &lang, Dialect::TypeScript))
 }
 
 pub fn walk_tsx<'py>(
     py: Python<'py>,
     path: &str,
     source: &[u8],
-    resolver: &Resolver<'py>,
+    res: &crate::Resolvers<'py>,
 ) -> PyResult<Outcome<'py>> {
     let lang = tree_sitter_typescript::LANGUAGE_TSX.into();
-    finish(extract(py, path, source, resolver, &lang, Dialect::TypeScript))
+    finish(extract(py, path, source, &res.js, &lang, Dialect::TypeScript))
 }
 
 pub fn walk_javascript<'py>(
     py: Python<'py>,
     path: &str,
     source: &[u8],
-    resolver: &Resolver<'py>,
+    res: &crate::Resolvers<'py>,
 ) -> PyResult<Outcome<'py>> {
     let lang = tree_sitter_javascript::LANGUAGE.into();
-    finish(extract(py, path, source, resolver, &lang, Dialect::JavaScript))
+    finish(extract(py, path, source, &res.js, &lang, Dialect::JavaScript))
 }
 
 fn finish<'py>(r: Result<Bound<'py, PyDict>, &'static str>) -> PyResult<Outcome<'py>> {

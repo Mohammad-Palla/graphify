@@ -14,11 +14,18 @@ use tree_sitter::Parser;
 use crate::Outcome;
 
 /// A native walker: bytes in, either a Graphify result dict or a reasoned deferral.
+///
+/// Every walker receives the whole [`crate::Resolvers`] bundle rather than the
+/// one resolver its language uses. The alternative -- a per-language resolver
+/// type in the signature -- would need either a separate registry per language or
+/// an enum at the dispatch point, and the registry being ONE table is the
+/// property that makes "which languages can go native" answerable by reading one
+/// function.
 pub type Walker = for<'py> fn(
     Python<'py>,
     &str,
     &[u8],
-    &crate::js::imports::Resolver<'py>,
+    &crate::Resolvers<'py>,
 ) -> PyResult<Outcome<'py>>;
 
 /// Languages with a parity-gated native walker.
@@ -36,17 +43,24 @@ pub type Walker = for<'py> fn(
 /// vue      typescript     474   99.6%      0.4%          0
 /// vue      javascript      36  100.0%      0.0%          0
 /// django   javascript     111   98.2%      1.8%          0
+/// django   python        2929   99.9%      0.1%          0
+/// bun      python           8  100.0%      0.0%          0
+/// graphify python         346  100.0%      0.0%          0
 /// ```
 ///
 /// The residual deferrals are, in order: a parse error (Python's recovery is
 /// authoritative), a decorator (mints stub nodes through `ensure_named_node`), a
 /// non-ASCII identifier (the id recipe's Unicode fixpoint is not reproduced), and
-/// one 9 MB fixture too deep to recurse into.
+/// one 9 MB fixture too deep to recurse into. Python's two are one parse error and
+/// one non-ASCII identifier.
 ///
-/// `python` is deliberately absent: it is routable by `_GRAMMAR_TO_LANGUAGE` but
-/// has no walker, so it defers at `walker_for`.
+/// Graphify's own source is in that table deliberately. django is one codebase
+/// with one house style, and a walker that only ever saw django would be gated on
+/// a sample that cannot exercise what it does not contain -- `graphify-src` brings
+/// walrus operators, `match`, heavy `typing` generics and `getattr` dispatch that
+/// django's 2,929 files barely use.
 pub fn supported() -> Vec<&'static str> {
-    vec!["typescript", "tsx", "javascript"]
+    vec!["typescript", "tsx", "javascript", "python"]
 }
 
 pub fn walker_for(language: &str) -> Option<Walker> {
@@ -54,6 +68,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
         "typescript" => Some(crate::js::walk_typescript),
         "tsx" => Some(crate::js::walk_tsx),
         "javascript" => Some(crate::js::walk_javascript),
+        "python" => Some(crate::py::walk_python),
         _ => None,
     }
 }
@@ -79,10 +94,14 @@ pub fn walker_for(language: &str) -> Option<Walker> {
 /// The node-kind and field counts change with essentially any grammar revision,
 /// which is what makes the triple a usable proxy for "same grammar".
 pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
-    let langs: [(&'static str, tree_sitter::Language); 3] = [
+    let langs: [(&'static str, tree_sitter::Language); 4] = [
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ("javascript", tree_sitter_javascript::LANGUAGE.into()),
+        // Fingerprinted before it is `supported()`, so the version agreement is
+        // proven by the same mechanism from the walker's first parity run rather
+        // than being switched on with it.
+        ("python", tree_sitter_python::LANGUAGE.into()),
     ];
     langs
         .iter()

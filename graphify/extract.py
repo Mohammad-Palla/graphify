@@ -1400,10 +1400,61 @@ def extract_python(path: Path) -> dict:
     parsed: list = []
     result = _extract_generic(path, _PYTHON_CONFIG, parsed_out=parsed)
     if "error" not in result:
-        # Reuse the structural pass's tree; `parsed` is empty only when that pass
-        # never parsed (native kernel), in which case the rationale pass parses.
-        _extract_python_rationale(path, result, parsed[0] if parsed else None)
+        native = result.pop("py_rationale", None)
+        if native is not None:
+            # The native walker already found the docstrings and rationale
+            # comments, from the parse it had to do anyway. Popped, not left in
+            # place: it is raw material for the rows below, never output.
+            _apply_python_rationale_native(path, result, native)
+        else:
+            # Reuse the structural pass's tree; `parsed` is empty only when that
+            # pass never parsed (a native walk whose rationale payload deferred),
+            # in which case the rationale pass parses.
+            _extract_python_rationale(path, result, parsed[0] if parsed else None)
     return result
+
+
+def _apply_python_rationale_native(path: Path, result: dict, items: list) -> None:
+    """Build the rationale nodes/edges from the kernel's `(text, line, parent_nid)`
+    triples, mutating `result` in place exactly as `_extract_python_rationale` does.
+
+    The kernel emits raw text rather than finished rows on purpose: the label goes
+    through `_shorten_rationale_label`, which is `textwrap.shorten` -- whitespace
+    collapsing, a word-boundary cut, a hyphen-splitting regex and a placeholder
+    fallback. Reproducing that in Rust would be a wide surface whose failures are
+    silent and cosmetic-looking, and it is not where the time goes. What the kernel
+    saves is the second PARSE of every Python file, which is the whole cost.
+
+    So the dedup set, the id recipe and the label all stay here, shared verbatim
+    with the pure-Python path.
+    """
+    nodes = result["nodes"]
+    edges = result["edges"]
+    seen_ids = {n["id"] for n in nodes}
+    stem = _file_stem(path)
+    str_path = str(path)
+    for item in items:
+        text, line, parent_nid = item["text"], item["line"], item["parent_nid"]
+        label = _shorten_rationale_label(text)
+        rid = _make_id(stem, "rationale", str(line))
+        if rid not in seen_ids:
+            seen_ids.add(rid)
+            nodes.append({
+                "id": rid,
+                "label": label,
+                "file_type": "rationale",
+                "source_file": str_path,
+                "source_location": f"L{line}",
+            })
+        edges.append({
+            "source": rid,
+            "target": parent_nid,
+            "relation": "rationale_for",
+            "confidence": "EXTRACTED",
+            "source_file": str_path,
+            "source_location": f"L{line}",
+            "weight": 1.0,
+        })
 
 
 def extract_js(path: Path) -> dict:
