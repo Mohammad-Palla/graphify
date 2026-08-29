@@ -406,6 +406,13 @@ def default_graph_json() -> str:
     return str(out_path("graph.json"))
 
 
+# Pure function of the path STRING, so unlike the resolve memo this needs no
+# per-run clearing -- there is no filesystem state in the answer. Bounded only so
+# a long-lived `watch` process cannot accumulate unboundedly.
+_ABS_ANY_CACHE: dict[str, bool] = {}
+_ABS_ANY_CACHE_MAX = 65536
+
+
 def is_absolute_any_platform(p: "str | Path | None") -> bool:
     """Whether *p* is absolute under POSIX **or** Windows rules.
 
@@ -438,7 +445,18 @@ def is_absolute_any_platform(p: "str | Path | None") -> bool:
     if not p:
         return False
     s = str(p)
-    return PurePosixPath(s).is_absolute() or PureWindowsPath(s).is_absolute()
+    cached = _ABS_ANY_CACHE.get(s)
+    if cached is None:
+        # TWO PurePath objects per call, and `build` asks about the same handful
+        # of source_file strings once per node and once per edge: 211,405 calls
+        # -> 422,810 constructions on django, 22% of the build stage's time. The
+        # answer depends only on the string -- no filesystem, no host state -- so
+        # it is memoisable outright, with no per-run invalidation to get wrong.
+        cached = PurePosixPath(s).is_absolute() or PureWindowsPath(s).is_absolute()
+        if len(_ABS_ANY_CACHE) >= _ABS_ANY_CACHE_MAX:
+            _ABS_ANY_CACHE.clear()
+        _ABS_ANY_CACHE[s] = cached
+    return cached
 
 
 # Legacy Windows path ceiling. Unless long-path support is enabled *and* every
