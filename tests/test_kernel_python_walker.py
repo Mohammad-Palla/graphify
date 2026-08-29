@@ -401,3 +401,35 @@ def test_dotted_relative_level_matches(tmp_path):
     assert _facts_repr(native) == _facts_repr(py)
     facts, _ = native
     assert facts.imports, "the two-dot relative import resolved to nothing"
+
+
+def test_subscript_annotation_visits_the_value_twice(tmp_path):
+    """`np.recarray[Any, Any]` -- a subscript annotation, which no corpus in the
+    gate set contains in a parameter position.
+
+    `_python_collect_type_refs`' subscript arm reads
+    `if c is value or not c.is_named: continue`, and `c is value` is ALWAYS FALSE:
+    py-tree-sitter returns a fresh Node wrapper per access, so the object from
+    `child_by_field_name("value")` is never the same OBJECT as the one from
+    `children`, though `==` and `.id` both say they are the same node. The value is
+    therefore visited a SECOND time with `generic=True`, and the annotation emits
+    both a `parameter_type` and a `generic_arg` reference to it.
+
+    The correct-looking translation -- comparing `.id()` -- drops that second visit
+    and changes the context on the surviving edge after dedup. It went unnoticed
+    across 3,284 files of walker parity and was found only when superset was added
+    as a corpus, on 11 edges.
+    """
+    native, py = _both(tmp_path, (
+        "import numpy as np\n"
+        "from typing import Any\n"
+        "class C:\n"
+        "    def go(self, rows: np.recarray[Any, Any]) -> None:\n"
+        "        pass\n"
+    ))
+    assert _canon(native) == _canon(py)
+    ctxs = sorted(e.get("context") for e in native["edges"]
+                  if e["relation"] == "references")
+    assert "generic_arg" in ctxs and "parameter_type" in ctxs, (
+        f"expected BOTH contexts from the double visit, got {ctxs}"
+    )

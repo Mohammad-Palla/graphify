@@ -137,9 +137,24 @@ pub fn collect_type_refs(ctx: &Ctx, node: Option<Node>, generic: bool, out: &mut
         "subscript" => {
             let value = node.child_by_field_name("value");
             collect_type_refs(ctx, value, generic, out)?;
-            let value_id = value.map(|v| v.id());
+            // Python's loop reads `if c is value or not c.is_named: continue`,
+            // and `c is value` is ALWAYS FALSE -- py-tree-sitter hands out a fresh
+            // Node wrapper per access, so the object from `child_by_field_name`
+            // is never the same OBJECT as the one from `children`, even though
+            // `==` and `.id` agree. The value child is therefore visited a second
+            // time here, with `generic=True`.
+            //
+            // So this deliberately does NOT skip it. An earlier version compared
+            // `c.id()` -- the correct-looking translation -- and dropped that
+            // second visit, which changed the `context` on 11 edges in superset
+            // (`rows: np.recarray[Any, Any]` emits both `parameter_type` and
+            // `generic_arg`, and dedup keeps the latter). django's 2,929 files and
+            // graphify-src's 347 contain no subscript annotation in a parameter or
+            // return position, so parity was DIVERGENT 0 on both while this was
+            // wrong. Reproducing behaviour, not repairing it: a fix belongs in the
+            // Python, where both paths would move together.
             for c in children(node) {
-                if Some(c.id()) == value_id || !c.is_named() {
+                if !c.is_named() {
                     continue;
                 }
                 collect_type_refs(ctx, Some(c), true, out)?;
