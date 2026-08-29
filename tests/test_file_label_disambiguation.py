@@ -125,3 +125,49 @@ def test_end_to_end_build_and_lookup(tmp_path):
     assert _find_node(G, "process-order/index.ts")
     po = _find_node(G, "process-order/index.ts")[0]
     assert G.nodes[po]["label"] == "process-order/index.ts"
+
+
+# ── _split_sf memo ────────────────────────────────────────────────────────────
+#
+# `_shortest_unique_suffix` is called once per member of a colliding-basename
+# group and rebuilt the segment lists of every OTHER member on each call --
+# quadratic in the group size over the same handful of strings. On django that
+# was 536,492 splits for 2,028 calls. The split is now memoized, which is only
+# sound if it stays a pure function and callers cannot mutate the shared value.
+
+def test_split_sf_normalizes_separators_and_drops_empty_segments():
+    from graphify.build import _split_sf
+    assert _split_sf("a/b/c.ts") == ("a", "b", "c.ts")
+    assert _split_sf("a\\b\\c.ts") == ("a", "b", "c.ts")
+    assert _split_sf("/a//b/") == ("a", "b")
+    assert _split_sf("") == ()
+
+
+def test_split_sf_returns_a_tuple_so_the_cached_value_cannot_be_mutated():
+    """It used to build a fresh list per call; a shared list would let one
+    caller's mutation corrupt every later comparison."""
+    from graphify.build import _split_sf
+    assert isinstance(_split_sf("a/b"), tuple)
+    assert _split_sf("a/b") is _split_sf("a/b")
+
+
+def test_split_sf_memo_does_not_change_the_suffix_answers():
+    """Same cases as the deterministic tests above, run twice so the second pass
+    is served from the cache."""
+    from graphify.build import _split_sf, _shortest_unique_suffix
+    _split_sf.cache_clear()
+    group = {"a/b/index.ts", "c/b/index.ts", "x/index.ts", "index.ts"}
+    for _ in range(2):
+        assert _shortest_unique_suffix("a/b/index.ts", group) == "a/b/index.ts"
+        assert _shortest_unique_suffix("x/index.ts", group) == "x/index.ts"
+        assert _shortest_unique_suffix("index.ts", group) == "index.ts"
+
+
+def test_shortest_unique_suffix_still_handles_windows_separators():
+    """The separator normalization moved into the memo; a backslash path and its
+    forward-slash twin must still be recognized as the SAME path, or a Windows
+    graph would disambiguate against itself."""
+    from graphify.build import _shortest_unique_suffix
+    assert _shortest_unique_suffix(
+        "a\\b\\index.ts", {"a\\b\\index.ts", "c/b/index.ts"}
+    ) == "a/b/index.ts"

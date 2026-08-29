@@ -27,6 +27,7 @@ import os
 import re
 import sys
 import unicodedata
+from functools import lru_cache
 from pathlib import Path
 import networkx as nx
 from .ids import make_id, normalize_id as _normalize_id
@@ -361,16 +362,28 @@ def _is_file_node_label(label: "str | None", source_file: "str | None") -> bool:
     return "/" in lbl and (sf == lbl or sf.endswith("/" + lbl))
 
 
+@lru_cache(maxsize=1 << 15)
+def _split_sf(sf: str) -> "tuple[str, ...]":
+    """Path segments of *sf*, separator-normalized and empty-stripped.
+
+    Memoized because `_shortest_unique_suffix` is called once per member of a
+    colliding-basename group and rebuilds the segment lists of every OTHER member
+    on each call -- quadratic in the group size over the same handful of strings.
+    On django that is 536,492 splits for 2,028 calls (0.46s); the `tests.py` group
+    alone has hundreds of members. Pure function of one string, so the result is
+    shared safely -- returned as a tuple rather than a list precisely so a caller
+    cannot mutate the cached value.
+    """
+    return tuple(p for p in sf.replace("\\", "/").split("/") if p)
+
+
 def _shortest_unique_suffix(sf: str, all_sfs: "set[str]") -> str:
     """Shortest trailing path suffix (basename + k parent dirs) of *sf* that is
     unique among *all_sfs*. `a/b/index.ts` vs `c/b/index.ts` -> `a/b/index.ts`;
     `x/index.ts` vs `y/index.ts` -> `x/index.ts`. Derived from the path (never the
     current label) so relabeling is idempotent across incremental rebuilds."""
-    parts = [p for p in sf.replace("\\", "/").split("/") if p]
-    others = [
-        [p for p in o.replace("\\", "/").split("/") if p]
-        for o in all_sfs if o != sf
-    ]
+    parts = _split_sf(sf)
+    others = [_split_sf(o) for o in all_sfs if o != sf]
     for k in range(1, len(parts) + 1):
         suffix = parts[-k:]
         if all(o[-k:] != suffix for o in others):
@@ -1098,22 +1111,43 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
     # the lone (wrong) "unambiguous" winner.
     from graphify.extractors.base import _file_stem as _fs
     _alias_candidates: dict[str, set[str]] = {}
+    # Everything this loop derives from a node -- the `Path`, the absoluteness
+    # verdict, the canonical stem and the pre-migration stem list -- is a function
+    # of `source_file` ALONE, but the loop runs per NODE, and a file contributes one
+    # node per symbol it defines. On django that is 50,513 iterations over 3,047
+    # distinct source files (16.6x), which cost 152k `Path` constructions and 1.09s
+    # in `_old_file_stems`. Hoisting the per-file half into a memo leaves only the
+    # genuinely per-node half (the label test and the suffix) in the loop.
+    #
+    # `None` is cached too -- it is the "skip this file" verdict for an absolute
+    # source_file, which must stay a `continue` rather than becoming an alias.
+    _per_sf: "dict[str, tuple[str, str, list[str]] | None]" = {}
     for nid in node_set:
         attrs = G.nodes[nid]
         sf = attrs.get("source_file")
         if not sf:
             continue
-        rel = Path(str(sf))
-        if _is_abs(str(sf)):
+        sf_key = str(sf)
+        if sf_key in _per_sf:
+            entry = _per_sf[sf_key]
+        else:
+            rel = Path(sf_key)
+            if _is_abs(sf_key):
+                entry = None
+            else:
+                entry = (rel.name, make_id(_fs(rel)), _old_file_stems(rel))
+            _per_sf[sf_key] = entry
+        if entry is None:
             continue
-        new_stem = make_id(_fs(rel))
-        if str(attrs.get("label", "")) == rel.name:
+        rel_name, new_stem, old_stems = entry
+        if str(attrs.get("label", "")) == rel_name:
             suffix = ""  # this node IS the file, whatever its (possibly salted) id
         else:
             suffix = ""
-            if _normalize_id(nid).startswith(new_stem):
-                suffix = _normalize_id(nid)[len(new_stem):]  # leading "_entity" or ""
-        for old_stem in _old_file_stems(rel):
+            norm_nid = _normalize_id(nid)
+            if norm_nid.startswith(new_stem):
+                suffix = norm_nid[len(new_stem):]  # leading "_entity" or ""
+        for old_stem in old_stems:
             if old_stem == new_stem:
                 continue
             alias = old_stem + suffix

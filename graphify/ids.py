@@ -43,8 +43,18 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from functools import lru_cache
 
 __all__ = ["normalize_id", "make_id"]
+
+# Compiled once. `re.sub(pattern, ...)` re-enters `re._compile` on every call to
+# look the pattern up in the module cache -- 845k dict lookups and 845k bound-method
+# dispatches on a django build, which measured 0.97s of the 2.46s this function
+# cost. `re.UNICODE` is the default for str patterns in Python 3; it is spelled out
+# here because it was spelled out in the original calls and the recipe is
+# id-critical (#2614).
+_NON_WORD = re.compile(r"[^\w]+", re.UNICODE)
+_UNDERSCORE_RUN = re.compile(r"_+")
 
 
 def normalize_id(s: str) -> str:
@@ -72,14 +82,35 @@ def normalize_id(s: str) -> str:
     so every combining mark casefold introduced has been fully normalized before
     it is filtered (#2614 and its combining-mark follow-on).
     """
+    return _normalize_id_cached(s)
+
+
+# Memoized because the recipe is a pure function of one string and the callers ask
+# the same questions over and over: a django build makes 405,271 calls carrying
+# 7,078 distinct strings (21.4x), because ids are rebuilt per NODE while the
+# strings that go into them are per FILE or per symbol NAME -- `'tests'` alone is
+# asked 12,763 times.
+#
+# Safe to cache by construction: the body reads nothing but its argument, `str` is
+# immutable and hashable, and the result is a new `str` the caller cannot mutate.
+# The idempotence, `\w`-only and caseless-stability guarantees above are properties
+# of the value, so returning a shared instance preserves all three.
+#
+# Bounded rather than unbounded: `normalize_id` also runs inside the extraction
+# workers, which are long-lived processes seeing one string per symbol, and an
+# unbounded dict there is a slow leak with no upper bound but the corpus. 128k
+# entries is ~18x the distinct count of a django build, so the cache never evicts
+# on a repo of that size and degrades to the uncached cost -- never worse -- above it.
+@lru_cache(maxsize=1 << 17)
+def _normalize_id_cached(s: str) -> str:
     cur = s
     for _ in range(6):
         nxt = unicodedata.normalize("NFKC", cur.casefold())
         if nxt == cur:
             break
         cur = nxt
-    cur = re.sub(r"[^\w]+", "_", cur, flags=re.UNICODE)
-    cur = re.sub(r"_+", "_", cur)
+    cur = _NON_WORD.sub("_", cur)
+    cur = _UNDERSCORE_RUN.sub("_", cur)
     return cur.strip("_")
 
 

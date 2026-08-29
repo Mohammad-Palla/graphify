@@ -201,6 +201,74 @@ def test_both_callers_share_one_implementation():
         assert fn("Ångström", "Ⅳ") == make_id("Ångström", "Ⅳ")
 
 
+# ── memoization ───────────────────────────────────────────────────────────────
+#
+# `normalize_id` is memoized because a django build makes 405,271 calls carrying
+# far fewer distinct strings -- ids are rebuilt per NODE while the strings that go
+# into them are per FILE or per symbol NAME, so `'tests'` alone is asked 12,763
+# times. The cache is only sound if the function is pure and the shared return
+# value cannot be mutated or observed as stale, which is what these pin.
+
+def test_normalize_id_is_memoized():
+    from graphify.ids import _normalize_id_cached
+    _normalize_id_cached.cache_clear()
+    before = _normalize_id_cached.cache_info()
+    s = "A Very Distinctive Label ÄÖÜ"
+    first = normalize_id(s)
+    second = normalize_id(s)
+    info = _normalize_id_cached.cache_info()
+    assert first == second
+    assert info.hits >= before.hits + 1, "second call did not hit the cache"
+
+
+def test_memoized_result_matches_the_uncached_recipe():
+    """The cache must not change the answer for anything -- including the Unicode
+    cases the fixpoint loop exists for (#2614)."""
+    from graphify.ids import _normalize_id_cached, _NON_WORD, _UNDERSCORE_RUN
+    import unicodedata
+
+    def uncached(s: str) -> str:
+        cur = s
+        for _ in range(6):
+            nxt = unicodedata.normalize("NFKC", cur.casefold())
+            if nxt == cur:
+                break
+            cur = nxt
+        cur = _NON_WORD.sub("_", cur)
+        cur = _UNDERSCORE_RUN.sub("_", cur)
+        return cur.strip("_")
+
+    for s in ["", "_", "___", "a.b.c", "Session ValidateToken", "İstanbul",
+              "ᾴ", "Ångström", "café-naïve", "ALLCAPS",
+              "mixed_Case.Path/To/File.py", "中文标识符",
+              "emoji\U0001f600here", "tabs\tand\nnewlines", "  padded  "]:
+        _normalize_id_cached.cache_clear()
+        assert normalize_id(s) == uncached(s), repr(s)
+        assert normalize_id(s) == uncached(s), repr(s)  # again, now cached
+
+
+def test_memoization_preserves_the_three_guarantees_on_a_cache_hit():
+    """Idempotence, \\w-only and caseless-stability are properties of the VALUE,
+    so a shared instance keeps them -- asserted on the hit, not just the miss."""
+    import re
+    for s in ["İstanbul", "Session_ValidateToken", "a..b__c", "ᾴ"]:
+        for _ in range(2):  # first miss, then hit
+            out = normalize_id(s)
+            assert normalize_id(out) == out
+            assert re.fullmatch(r"[\w]*", out, re.UNICODE)
+            assert normalize_id(s.casefold()) == out
+
+
+def test_precompiled_patterns_match_the_inline_recipe():
+    """The patterns were moved to module constants to skip `re._compile` on every
+    call; they must still be the same patterns with the same flags."""
+    import re
+    from graphify.ids import _NON_WORD, _UNDERSCORE_RUN
+    for s in ["a b", "a b", "中-文", "x__y", "!!!"]:
+        assert _NON_WORD.sub("_", s) == re.sub(r"[^\w]+", "_", s, flags=re.UNICODE)
+        assert _UNDERSCORE_RUN.sub("_", s) == re.sub(r"_+", "_", s)
+
+
 # Optional property-based fuzzing — hypothesis is a dev dependency. Skip cleanly
 # if it is unavailable so the deterministic cases above still run everywhere.
 hypothesis = pytest.importorskip("hypothesis")

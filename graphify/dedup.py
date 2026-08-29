@@ -47,8 +47,11 @@ def _shingles(text: str, k: int = 3) -> set[str]:
 def _make_minhash(text: str, num_perm: int = 128) -> MinHash:
     # Strip spaces so "graph extractor" and "graphextractor" share shingles
     m = MinHash(num_perm=num_perm)
-    for shingle in _shingles(text.replace(" ", "")):
-        m.update(shingle.encode("utf-8"))
+    # `update_batch` rather than a loop over `update`: same sketch, one vectorized
+    # pass instead of one 128-wide numpy expression per shingle. `_shingles` is a
+    # set, so the order the values arrive in varies -- which does not matter, the
+    # sketch is an elementwise min and min does not care.
+    m.update_batch([s.encode("utf-8") for s in _shingles(text.replace(" ", ""))])
     return m
 
 

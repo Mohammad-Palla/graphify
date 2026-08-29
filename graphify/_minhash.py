@@ -20,6 +20,10 @@ import numpy as np
 _MP = np.uint64((1 << 61) - 1)  # Mersenne prime for the hash family
 _MH = np.uint64(0xFFFF_FFFF)    # mask to 32-bit values
 
+# Values per vectorized `update_batch` step -- caps the intermediate at
+# _BATCH x num_perm uint64 (4 MB at the 128 perms dedup uses).
+_BATCH = 4096
+
 # One (a, b) coefficient array per num_perm, shared across all instances.
 _MH_COEFFS: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 
@@ -47,6 +51,42 @@ class MinHash:
         hv = np.uint64(struct.unpack("<I", hashlib.sha1(v).digest()[:4])[0])
         phv = np.bitwise_and((self._a * hv + self._b) % _MP, _MH)
         self.hashvalues = np.minimum(self.hashvalues, phv)
+
+    def update_batch(self, vs) -> None:
+        """Absorb many values at once. Equivalent to `update` in a loop.
+
+        Same permutation family, same arithmetic, same dtype -- the only change is
+        the shape it runs at. `update` evaluates a 128-wide numpy expression per
+        VALUE, so a dedup pass paid four numpy dispatches plus a temporary array
+        per shingle: 394,940 calls and 1.95s on a django build, the single largest
+        line in the whole `build` stage. Unlike everything else in that stage this
+        work is not redundant -- all 8,495 sketches are distinct -- so the only
+        lever is to stop paying per-element overhead on a per-element loop.
+
+        Identical output, not merely equivalent: `min` over the permuted values is
+        associative and commutative, and every intermediate is exact in uint64
+        (`_MP` is 2**61-1, so `a*hv + b` wraps the same way at any shape). Asserted
+        against the scalar loop in `tests/test_minhash.py`.
+
+        Chunked because the intermediate is len(vs) x num_perm uint64 -- 1 KB per
+        value at num_perm=128. Labels shingle to tens of values, but this is a
+        library method and a caller with a large document should not materialize a
+        multi-hundred-MB temporary.
+        """
+        vs = list(vs)
+        if not vs:
+            return
+        acc = self.hashvalues
+        for i in range(0, len(vs), _BATCH):
+            chunk = vs[i : i + _BATCH]
+            hv = np.frombuffer(
+                b"".join(hashlib.sha1(v).digest()[:4] for v in chunk), dtype="<u4"
+            ).astype(np.uint64)
+            phv = np.bitwise_and(
+                (self._a[None, :] * hv[:, None] + self._b[None, :]) % _MP, _MH
+            )
+            acc = np.minimum(acc, phv.min(axis=0))
+        self.hashvalues = acc
 
 
 def _lsh_integrate(f, lo: float, hi: float, n: int = 128) -> float:
