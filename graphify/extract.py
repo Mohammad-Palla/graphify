@@ -5653,6 +5653,10 @@ def _extract_single_file(args: tuple) -> tuple[int, dict] | tuple[int, dict, dic
     _t0 = _pc()
     result = _safe_extract_with_xaml_root(extractor, path, root)
     t["extract"] = _pc() - _t0
+    # Per-suffix attribution of `extract`, so the parent can say WHICH languages
+    # the walk time belongs to. Keyed "lang:" and excluded from busy_total --
+    # this is a partition of `extract`, not additional work.
+    t["lang:" + (path.suffix.lower() or "<none>")] = t["extract"]
     if not bypass_cache and "error" not in result and result.get("nodes"):
         _t0 = _pc()
         save_cached(path, result, root, cache_root=cache_location)
@@ -5817,7 +5821,10 @@ def _extract_parallel(
         _self, _kids = _cpu_times()
         _self -= _pool_self0
         _kids -= _pool_kids0
-        _busy = sum(v for k, v in _wsum.items() if k not in ("files", "bytes"))
+        _busy = sum(
+            v for k, v in _wsum.items()
+            if k not in ("files", "bytes") and not k.startswith("lang:")
+        )
         _prof_print("pool.wall", f"{_pool_wall:.1f}s  (capacity {_pool_wall * max_workers:.0f} worker-s)")
         _prof_print("pool.cpu_children", f"{_kids:.1f}s  ({_kids / max(_pool_wall * max_workers, 1e-9) * 100:.0f}% of capacity)")
         _prof_print("pool.cpu_parent", f"{_self:.1f}s  (executor queue-management thread: result UNPICKLING)")
@@ -5826,6 +5833,21 @@ def _extract_parallel(
             _v = _wsum.get(_k, 0.0)
             _prof_print(f"worker.{_k}", f"{_v:.1f}s  ({_v / max(_busy, 1e-9) * 100:.0f}% of worker busy)")
         _prof_print("worker.busy_total", f"{_busy:.1f}s  ({_busy / max(_kids, 1e-9) * 100:.0f}% of children CPU)")
+        _langs = sorted(
+            ((k[5:], v) for k, v in _wsum.items() if k.startswith("lang:")),
+            key=lambda kv: -kv[1],
+        )
+        _ext_total = sum(v for _, v in _langs)
+        for _sfx, _v in _langs[:15]:
+            _prof_print(
+                f"worker.extract.{_sfx}",
+                f"{_v:.1f}s  ({_v / max(_ext_total, 1e-9) * 100:.0f}% of extract)",
+            )
+        if len(_langs) > 15:
+            _prof_print(
+                "worker.extract.<rest>",
+                f"{sum(v for _, v in _langs[15:]):.1f}s  ({len(_langs) - 15} more suffixes)",
+            )
     return True
 
 
