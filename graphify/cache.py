@@ -606,6 +606,35 @@ def _relativize_source_files_in(payload: dict, root: Path) -> None:
     # source_file the same way nodes/edges/hyperedges do, so it needs the same
     # portable-path treatment for cache entries to round-trip correctly across
     # machines/checkout directories.
+    # Every node and edge of one file carries the SAME source_file string, so the
+    # pathlib construction, the exists() stat and the relpath below were being
+    # recomputed once per item: 12,894 values for 304 distinct ones on a 300-file
+    # Bun sample, 42x redundant. The rewrite is a pure function of (source, root)
+    # and root is fixed for this call, so one memo per payload collapses it.
+    # Value None means "leave this item alone", which is what every `continue`
+    # branch below decided.
+    memo: dict[str, str | None] = {}
+
+    def _rewritten(source: str) -> "str | None":
+        sp = Path(source)
+        if not sp.is_absolute():
+            # os.path.abspath is lexical (no symlink resolution), matching
+            # the symbolic relativization below.
+            cwd_form = Path(os.path.abspath(sp))
+            try:
+                if cwd_form == root_resolved / sp or not cwd_form.exists():
+                    return None  # already root-relative, or a ghost path
+            except OSError:
+                return None
+            sp = cwd_form
+        try:
+            rel = os.path.relpath(sp, root_resolved)
+        except (ValueError, OSError):
+            return None  # out-of-root (e.g. Windows cross-drive)
+        if rel == ".." or rel.startswith(".." + os.sep) or rel.startswith("../"):
+            return None  # escaped root — keep absolute
+        return rel.replace(os.sep, "/")
+
     for bucket in ("nodes", "edges", "hyperedges", "raw_calls"):
         for item in payload.get(bucket, []):
             if not isinstance(item, dict):
@@ -613,24 +642,12 @@ def _relativize_source_files_in(payload: dict, root: Path) -> None:
             source = item.get("source_file")
             if not source:
                 continue
-            sp = Path(source)
-            if not sp.is_absolute():
-                # os.path.abspath is lexical (no symlink resolution), matching
-                # the symbolic relativization below.
-                cwd_form = Path(os.path.abspath(sp))
-                try:
-                    if cwd_form == root_resolved / sp or not cwd_form.exists():
-                        continue  # already root-relative, or a ghost path
-                except OSError:
-                    continue
-                sp = cwd_form
-            try:
-                rel = os.path.relpath(sp, root_resolved)
-            except (ValueError, OSError):
-                continue  # out-of-root (e.g. Windows cross-drive)
-            if rel == ".." or rel.startswith(".." + os.sep) or rel.startswith("../"):
-                continue  # escaped root — keep absolute
-            item["source_file"] = rel.replace(os.sep, "/")
+            if source in memo:
+                rel = memo[source]
+            else:
+                rel = memo[source] = _rewritten(source)
+            if rel is not None:
+                item["source_file"] = rel
 
 
 def _normalize_source_file_value(src: "str | Path", root_resolved: Path) -> str:
@@ -831,7 +848,14 @@ def _relativize_ids_in(payload: dict, path: "str | Path", root: Path) -> None:
     if not id_anchors and not path_anchors:
         return
 
-    def anchor(value: str) -> str:
+    # _rewrite_strings visits every string in the payload and most repeat --
+    # 78,134 visits for 18,737 distinct values on a 300-file Bun sample. The
+    # rewrite depends only on (value, anchors) and the anchors are fixed here,
+    # so the result is memoised per payload; the walk still visits everything,
+    # but the anchor scan runs once per distinct string.
+    seen: dict[str, str] = {}
+
+    def _anchored(value: str) -> str:
         # Path form first: it requires a separator, which an id never contains.
         for a in path_anchors:
             if value == a:
@@ -843,6 +867,12 @@ def _relativize_ids_in(payload: dict, path: "str | Path", root: Path) -> None:
             if value.startswith(a + "_"):
                 return _ROOT_MARKER + "_" + value[len(a) + 1:]
         return value
+
+    def anchor(value: str) -> str:
+        got = seen.get(value)
+        if got is None:
+            got = seen[value] = _anchored(value)
+        return got
 
     _rewrite_strings(payload, anchor)
 
