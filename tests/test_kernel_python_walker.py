@@ -74,6 +74,7 @@ def _both(tmp_path, source: str, name: str = "m.py"):
     # part of the graph. The control arm has no counterpart; `_xfile_both` below
     # compares it where it matters, at that pass's boundary.
     native.pop("py_xfile", None)
+    native.pop("py_symbol_facts", None)
 
     with _seam_disabled():
         py = _extract_generic(p, _PYTHON_CONFIG)
@@ -165,7 +166,9 @@ def test_form_feed_defers_the_rationale_payload_only(tmp_path):
     assert "py_rationale" not in native, "the rationale payload must defer on a form feed"
     # And the end-to-end result must still match, via the Python fallback.
     got = extract_python(p)
-    got.pop("py_xfile", None)   # phase-3 raw material; the control has no counterpart
+    # phase-3 raw material; the control arm has no counterpart
+    got.pop("py_xfile", None)
+    got.pop("py_symbol_facts", None)
     assert _canon(got) == _canon(_fallback(p))
 
 
@@ -299,3 +302,102 @@ def test_reference_line_is_the_first_occurrence(tmp_path):
     assert _canon(native) == _canon(py)
     locs = {e["source_location"] for e in native if e["relation"] == "uses"}
     assert locs == {"L3"}, f"expected the first reference line only, got {locs}"
+
+
+# ── symbol-resolution fact fusion (`py_symbol_facts`) ────────────────────────
+
+def _facts_both(tmp_path, files: dict[str, str], target: str):
+    """(native, python) `(facts, deferred)` for one file of a small package."""
+    from graphify.extractors.kernel import py_facts_from_native
+    from graphify.extractors.resolution import _collect_python_facts_one_file
+
+    for name, body in files.items():
+        p = tmp_path / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body)
+    path = tmp_path / target
+    result = extract_python(path)
+    payload = result.get("py_symbol_facts")
+    assert payload is not None, "no py_symbol_facts payload; this test proves nothing"
+    native = py_facts_from_native(path, tmp_path, payload)
+    assert native is not None, "the converter deferred; this test proves nothing"
+    with _seam_disabled():
+        py = _collect_python_facts_one_file(path, tmp_path)
+    return native, py
+
+
+def _facts_repr(pair):
+    facts, deferred = pair
+    out = {}
+    for bucket in ("imports", "exports", "uses", "module_imports", "declarations",
+                   "aliases", "star_exports", "namespace_exports"):
+        for obj, tag in ((facts, "f"), (deferred, "d")):
+            v = getattr(obj, bucket, None)
+            if v:
+                out[f"{tag}.{bucket}"] = [_canon(x) for x in v]
+    return _canon(out)
+
+
+def test_symbol_facts_imports_and_uses_match(tmp_path):
+    native, py = _facts_both(tmp_path, {
+        "m.py": "class Alpha:\n    pass\n\ndef helper():\n    pass\n",
+        "u.py": (
+            "from .m import Alpha, helper as h\n"
+            "def top():\n"
+            "    h()\n"
+            "    return Alpha()\n"
+            "class C:\n"
+            "    def method(self):\n"
+            "        return helper()\n"
+        ),
+    }, "u.py")
+    assert _facts_repr(native) == _facts_repr(py)
+    facts, _ = native
+    assert facts.imports, "no import facts produced"
+    assert facts.uses, "no use facts produced"
+    assert all("method" not in u.source_id for u in facts.uses), (
+        "only TOP-LEVEL function bodies contribute uses; a method's calls must not"
+    )
+
+
+def test_submodule_redirect_matches(tmp_path):
+    """#1146: `from pkg import submod` where the target is a package and the
+    imported name is a real submodule file redirects to that FILE, not the
+    package. The probe is `is_file()`, so it stays in Python -- this checks the
+    split lands the fact in `module_imports` on both paths."""
+    native, py = _facts_both(tmp_path, {
+        "pkg/__init__.py": "",
+        "pkg/submod.py": "def go():\n    pass\n",
+        "u.py": "from .pkg import submod\ndef top():\n    return submod\n",
+    }, "u.py")
+    assert _facts_repr(native) == _facts_repr(py)
+    facts, _ = native
+    assert facts.module_imports, (
+        "the submodule redirect produced nothing, so this test would pass with the "
+        "redirect removed"
+    )
+
+
+def test_init_py_also_produces_exports(tmp_path):
+    """An `__init__.py` re-export contributes BOTH an import and an export fact."""
+    native, py = _facts_both(tmp_path, {
+        "p/__init__.py": "from .inner import Thing\n",
+        "p/inner.py": "class Thing:\n    pass\n",
+    }, "p/__init__.py")
+    assert _facts_repr(native) == _facts_repr(py)
+    facts, _ = native
+    assert facts.exports, "an __init__.py re-export must produce an export fact"
+
+
+def test_dotted_relative_level_matches(tmp_path):
+    """`level` is the leading-dot count and selects the base directory; getting it
+    wrong retargets every relative import in a package."""
+    native, py = _facts_both(tmp_path, {
+        "a/__init__.py": "",
+        "a/m.py": "class Thing:\n    pass\n",
+        "a/b/__init__.py": "",
+        "a/b/u.py": "from ..m import Thing\ndef top():\n    return Thing()\n",
+    }, "a/b/u.py")
+    assert _facts_repr(native) == _facts_repr(py)
+    facts, _ = native
+    assert facts.imports, "the two-dot relative import resolved to nothing"

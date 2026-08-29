@@ -45,6 +45,7 @@ use crate::js::emit::{self, EdgeRow, NodeRow, RawCall, Val};
 use crate::Outcome;
 
 pub mod calls;
+pub mod facts;
 pub mod helpers;
 pub mod imports;
 pub mod rationale;
@@ -390,6 +391,17 @@ fn extract<'py>(
             out.set_item("py_xfile", payload).map_err(|_| "py_error")?;
         }
         Err(_reason) => { /* xfile defers; the parent parses this file itself */ }
+    }
+
+    // Symbol-resolution facts, from THIS parse. Without them
+    // `_collect_python_facts_one_file` parses every Python file a SECOND time.
+    // A fourth separate deferral axis.
+    match facts::collect(&ctx, root) {
+        Ok(f) => {
+            let payload = facts::to_py(py, &f).map_err(|_| "py_error")?;
+            out.set_item("py_symbol_facts", payload).map_err(|_| "py_error")?;
+        }
+        Err(_reason) => { /* facts defer; Python collects them for this file */ }
     }
     Ok(out)
 }

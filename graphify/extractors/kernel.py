@@ -397,6 +397,80 @@ def js_facts_from_native(path: Path, payload: Any) -> tuple | None:
         return None
 
 
+def py_facts_from_native(path: Path, root: Path, payload: Any) -> tuple | None:
+    """Turn the kernel's Python fact payload into `_SymbolResolutionFacts`.
+
+    The native side ships the PARSED material -- each `from ... import ...` as
+    `(level, module_name, line, [(imported, local)])` and each top-level
+    function's calls as `(source_id, [(callee, line)])` -- and every filesystem
+    decision is made here: `_resolve_python_module_path`, and the `is_file()`
+    probes that redirect `from pkg import submod` to the submodule file (#1146).
+
+    That split was measured, not assumed. Over django's 2,929 files the pass costs
+    6.39s serially, of which parse is 2.26s and the walk 3.84s -- both free once
+    phase 2 has done them -- against 0.28s of module resolution over 10,176 calls,
+    which is what moves from the pool into this serial parent. 95.6% of the work
+    moves to where it is already paid for. Had the ratio gone the other way the
+    fusion would have been a loss, because unlike the cross-file pass this one was
+    already parallel.
+
+    Returns `(facts, deferred)` to match `collect_one`'s contract. Python has a
+    single `uses` producer, so `deferred` is always empty.
+    """
+    from graphify.extractors.models import (
+        _SymbolExportFact,
+        _SymbolImportFact,
+        _SymbolResolutionFacts,
+        _SymbolUseFact,
+    )
+    from graphify.extractors.base import _file_stem, _make_id
+    from graphify.extractors.resolution import _resolve_python_module_path
+
+    try:
+        facts = _SymbolResolutionFacts()
+        deferred = _SymbolResolutionFacts()
+        is_init = path.name == "__init__.py"
+        for level, module_name, line, names in payload["imports"]:
+            target_path = _resolve_python_module_path(module_name, path, root, level)
+            if target_path is None:
+                continue
+            pkg_dir = target_path.parent if target_path.name == "__init__.py" else None
+            for imported_name, local_name in names:
+                if pkg_dir is not None:
+                    sub_py = pkg_dir / f"{imported_name}.py"
+                    sub_pkg = pkg_dir / imported_name / "__init__.py"
+                    submodule = (sub_py if sub_py.is_file()
+                                 else (sub_pkg if sub_pkg.is_file() else None))
+                    if submodule is not None:
+                        facts.module_imports.append((path, submodule, line, local_name))
+                        continue
+                facts.imports.append(
+                    _SymbolImportFact(path, local_name, target_path, imported_name, line)
+                )
+                if is_init:
+                    facts.exports.append(
+                        _SymbolExportFact(path, local_name, line,
+                                          target_path=target_path,
+                                          target_name=imported_name)
+                    )
+        # The payload carries the function NAME; the id is minted here, from the
+        # path this run is looking at. Baking `_make_id(_file_stem(path), name)`
+        # into the payload embedded the scan root's slug in the portable AST cache
+        # (#2257) -- caught by test_warm_cache_from_another_root_does_not_leak.
+        stem = _file_stem(path)
+        for source_name, calls in payload["uses"]:
+            source_id = _make_id(stem, source_name)
+            for callee, line in calls:
+                facts.uses.append(
+                    _SymbolUseFact(path, source_id, callee, "calls", "call", line)
+                )
+        return facts, deferred
+    except Exception:
+        # A shape the converter does not understand must cost a deferral, not a
+        # half-built fact set: phase 3 re-collects this file in Python.
+        return None
+
+
 def try_extract(path: Path, config: Any,
                 source_override: bytes | None = None) -> dict | None:
     """Extract `path` natively, or return None to mean "use the Python path".

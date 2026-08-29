@@ -2137,6 +2137,7 @@ def _collect_python_symbol_resolution_facts(
     *,
     parallel: bool = True,
     max_workers: "int | None" = None,
+    precomputed: "dict[Path, tuple] | None" = None,
 ) -> None:
     _collect_file_symbol_facts(
         paths,
@@ -2145,6 +2146,7 @@ def _collect_python_symbol_resolution_facts(
         collect_one=functools.partial(_collect_python_facts_one_file, root=root),
         parallel=parallel,
         max_workers=max_workers,
+        precomputed=precomputed,
     )
 
 
@@ -2162,13 +2164,15 @@ def _augment_symbol_resolution_edges(
     parallel: bool = True,
     max_workers: "int | None" = None,
     precomputed_js_facts: "dict[Path, tuple] | None" = None,
+    precomputed_py_facts: "dict[Path, tuple] | None" = None,
 ) -> None:
     facts = _SymbolResolutionFacts()
     _pool = {"parallel": parallel, "max_workers": max_workers}
     _js_pool = dict(_pool, precomputed=precomputed_js_facts)
+    _py_pool = dict(_pool, precomputed=precomputed_py_facts)
     if not _AUGMENT_PROFILE:
         _collect_js_symbol_resolution_facts(paths, facts, **_js_pool)
-        _collect_python_symbol_resolution_facts(paths, root, facts, **_pool)
+        _collect_python_symbol_resolution_facts(paths, root, facts, **_py_pool)
         _apply_symbol_resolution_facts(paths, nodes, edges, root, facts)
         return
 
@@ -2177,7 +2181,7 @@ def _augment_symbol_resolution_edges(
     _collect_js_symbol_resolution_facts(paths, facts, **_js_pool)
     _js = _time.perf_counter() - _t
     _t = _time.perf_counter()
-    _collect_python_symbol_resolution_facts(paths, root, facts, **_pool)
+    _collect_python_symbol_resolution_facts(paths, root, facts, **_py_pool)
     _py = _time.perf_counter() - _t
     _t = _time.perf_counter()
     _apply_symbol_resolution_facts(paths, nodes, edges, root, facts)

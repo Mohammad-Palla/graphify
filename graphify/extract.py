@@ -6336,16 +6336,27 @@ def extract(
     # the pipeline. Files the walker deferred are simply absent from the map and
     # are collected in Python as before.
     _js_facts: dict[Path, tuple] = {}
+    _py_facts: dict[Path, tuple] = {}
     for _i, _result in enumerate(per_file):
-        if not _result or "js_symbol_facts" not in _result:
+        if not _result:
             continue
-        _built = _kernel_seam.js_facts_from_native(paths[_i], _result["js_symbol_facts"])
-        if _built is not None:
-            _js_facts[paths[_i]] = _built
+        if "js_symbol_facts" in _result:
+            _built = _kernel_seam.js_facts_from_native(paths[_i], _result["js_symbol_facts"])
+            if _built is not None:
+                _js_facts[paths[_i]] = _built
+        # Same fusion for Python: without it `_collect_python_facts_one_file`
+        # parses every .py file a SECOND time. Measured 95.6% parse-and-walk,
+        # which phase 2 has already paid for -- see `py_facts_from_native`.
+        if "py_symbol_facts" in _result:
+            _built = _kernel_seam.py_facts_from_native(
+                paths[_i], root, _result["py_symbol_facts"])
+            if _built is not None:
+                _py_facts[paths[_i]] = _built
     _augment_symbol_resolution_edges(
         paths, all_nodes, all_edges, root,
         parallel=parallel, max_workers=max_workers,
         precomputed_js_facts=_js_facts,
+        precomputed_py_facts=_py_facts,
     )
     _p3.mark("augment_symbol_res")
 
