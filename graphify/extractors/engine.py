@@ -2868,13 +2868,24 @@ def _ruby_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: st
     return True
 
 def _extract_generic(
-    path: Path, config: LanguageConfig, *, source_override: bytes | None = None
+    path: Path, config: LanguageConfig, *, source_override: bytes | None = None,
+    parsed_out: list | None = None,
 ) -> dict:
     """Generic AST extractor driven by LanguageConfig.
 
     ``source_override`` parses the given bytes instead of reading ``path``, while
     still keying nodes/edges off ``path``. Lets container formats (e.g. Vue SFCs)
     mask the wrapper and parse just the embedded ``<script>``.
+
+    ``parsed_out``, when given, receives a single ``(tree, source)`` tuple so a
+    caller running a SECOND pass over the same file can reuse this parse instead
+    of doing its own. It cannot be returned in the result dict: results are
+    pickled across the process pool, and a tree-sitter Tree is not picklable --
+    the same reason the JS symbol-fact side channel ships plain tuples.
+
+    The tuple is appended only when this function actually parses. A file handled
+    by the native kernel returns before the parse and appends nothing, so callers
+    must treat an empty list as "no tree, parse it yourself".
     """
     # Native kernel first, if one is built AND parity-gated for this grammar.
     # This is the whole native seam: one call, at the single point every language
@@ -2936,6 +2947,10 @@ def _extract_generic(
         source = path.read_bytes() if source_override is None else source_override
         tree = parser.parse(source)
         root = tree.root_node
+        if parsed_out is not None:
+            # Hand the caller this parse. `tree` must stay referenced for its
+            # nodes to remain valid, which the caller's list does.
+            parsed_out.append((tree, source))
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
 
