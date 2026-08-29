@@ -17,6 +17,7 @@ flow) and every reader honours it.
 from __future__ import annotations
 
 import json
+from itertools import islice
 import os
 import re
 import stat
@@ -93,12 +94,43 @@ def write_text_atomic(path: "str | Path", text: str) -> None:
     _atomic_replace(path, lambda f: f.write(text))
 
 
+_JSON_BLOCK_CHUNKS = 4096
+
+
+def _stream_json(obj, f, *, indent: "int | None", ensure_ascii: bool) -> None:
+    """`json.dump(obj, f, ...)`, byte for byte, without the per-chunk write.
+
+    `json.dump` is a Python-level `for chunk in iterencode(obj): fp.write(chunk)`.
+    The encoder yields a chunk per token, so a 62 MB graph.json costs 10,372,153
+    loop iterations and 10,372,153 `write` calls -- 3.6s of the 14.1s profiled
+    `json.dump` on superset, spent on dispatch rather than encoding.
+
+    `json.dumps` avoids it by running that iteration inside `str.join`, in C --
+    but it materializes the whole document, which is exactly what streaming here
+    exists to avoid on very large graphs. Joining a bounded BLOCK of chunks gets
+    the C loop and keeps the bound: 4096 chunks is a few hundred KB, against
+    62 MB for the whole string.
+
+    Byte-identical by construction, not by coincidence: this is the same encoder
+    with the same arguments, and the only change is where the concatenation
+    happens. `json.dump` builds its encoder with exactly these two non-default
+    arguments, and `JSONEncoder` derives `item_separator` from `indent` itself,
+    so the separator handling matches too. Asserted in tests/test_atomic_writes.py.
+    """
+    it = json.JSONEncoder(indent=indent, ensure_ascii=ensure_ascii).iterencode(obj)
+    while True:
+        block = "".join(islice(it, _JSON_BLOCK_CHUNKS))
+        if not block:
+            break
+        f.write(block)
+
+
 def write_json_atomic(path: "str | Path", obj, *, indent: "int | None" = None, ensure_ascii: bool = True) -> None:
     """Atomically write ``obj`` as JSON to ``path``, streaming the encode into the
     temp file rather than materializing the whole string first (matters for very
     large graphs). ``ensure_ascii`` mirrors ``json.dump`` so callers that emit raw
     UTF-8 (non-ASCII labels/paths) keep byte-for-byte output. See :func:`_atomic_replace`."""
-    _atomic_replace(path, lambda f: json.dump(obj, f, indent=indent, ensure_ascii=ensure_ascii))
+    _atomic_replace(path, lambda f: _stream_json(obj, f, indent=indent, ensure_ascii=ensure_ascii))
 
 # Directory segments that, when they appear as a whole path component, mark the
 # whole path as a test location. Matched against path *segments* (not raw

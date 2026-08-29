@@ -176,3 +176,98 @@ def test_write_json_atomic_ensure_ascii_false_preserves_utf8(tmp_path):
     assert "Wörker 数据" in raw  # raw UTF-8, not \\uXXXX escapes
     assert "\\u" not in raw
     assert json.loads(raw) == {"label": "Wörker 数据"}
+
+
+# ── _stream_json ──────────────────────────────────────────────────────────────
+#
+# `write_json_atomic` streams rather than materializing the document, which is
+# right for a 62 MB graph.json. But `json.dump` streams with a Python-level
+# `for chunk in iterencode(obj): fp.write(chunk)`, and the encoder yields a chunk
+# per TOKEN -- 10,372,153 iterations and 10,372,153 write calls for django's
+# graph.json, 3.6s of superset's 14.1s profiled json.dump spent on dispatch.
+# `_stream_json` joins a bounded block of chunks so the iteration runs in C,
+# keeping the memory bound (4096 chunks, a few hundred KB) that `json.dumps`
+# would give up.
+#
+# The whole change rests on the output being byte-identical, so that is what is
+# asserted -- against `json.dump` itself, not against a fixture.
+
+import io
+import json as _json
+
+import pytest
+
+from graphify.paths import _stream_json
+
+
+_JSON_CASES = [
+    {"a": 1, "b": [1, 2, {"c": None}], "d": "ünïcødé", "e": True, "f": 1.5},
+    [], {}, [[]], {"k": {}}, {"x": [{"y": [1, [2, [3]]]}]},
+    {"deep": {"a": {"b": {"c": {"d": [1, 2, 3]}}}}},
+    list(range(5000)),
+    {str(i): {"v": i, "s": "x" * 10} for i in range(2000)},
+    "bare string", 42, None, True, 3.14159, -0.0,
+    {"esc": '"\\\n\t\r\x00', "empty_key": ""},
+]
+
+
+@pytest.mark.parametrize("obj", _JSON_CASES, ids=range(len(_JSON_CASES)))
+@pytest.mark.parametrize("indent", [None, 0, 2, 4])
+@pytest.mark.parametrize("ensure_ascii", [True, False])
+def test_stream_json_is_byte_identical_to_json_dump(obj, indent, ensure_ascii):
+    ref = io.StringIO()
+    _json.dump(obj, ref, indent=indent, ensure_ascii=ensure_ascii)
+    got = io.StringIO()
+    _stream_json(obj, got, indent=indent, ensure_ascii=ensure_ascii)
+    assert got.getvalue() == ref.getvalue()
+
+
+def test_stream_json_spans_many_blocks():
+    """A document large enough to cross the block boundary many times -- an
+    off-by-one in the islice loop would drop or duplicate a block, and a
+    single-block document could never show it."""
+    from graphify.paths import _JSON_BLOCK_CHUNKS
+    obj = [{"i": i, "s": f"value-{i}"} for i in range(_JSON_BLOCK_CHUNKS * 3)]
+    ref = io.StringIO()
+    _json.dump(obj, ref, indent=2, ensure_ascii=True)
+    got = io.StringIO()
+    _stream_json(obj, got, indent=2, ensure_ascii=True)
+    assert got.getvalue() == ref.getvalue()
+    assert len(got.getvalue()) > 100_000
+
+
+def test_stream_json_does_not_materialize_the_whole_document():
+    """The memory bound is the reason this is not simply `f.write(json.dumps(...))`.
+
+    The largest single string handed to `write` must stay far below the total,
+    or the streaming guarantee `write_json_atomic` documents is gone.
+    """
+    obj = [{"i": i, "payload": "x" * 200} for i in range(20_000)]
+
+    class Recorder(io.StringIO):
+        def __init__(self):
+            super().__init__()
+            self.largest = 0
+
+        def write(self, s):
+            self.largest = max(self.largest, len(s))
+            return super().write(s)
+
+    rec = Recorder()
+    _stream_json(obj, rec, indent=2, ensure_ascii=True)
+    total = len(rec.getvalue())
+    assert total > 4_000_000
+    assert rec.largest < total // 10, (
+        f"largest single write {rec.largest} of {total} -- not streaming"
+    )
+
+
+def test_write_json_atomic_round_trips_through_stream_json(tmp_path):
+    from graphify.paths import write_json_atomic
+    obj = {"nodes": [{"id": f"n{i}", "label": "ünïcødé"} for i in range(500)]}
+    dest = tmp_path / "graph.json"
+    write_json_atomic(dest, obj, indent=2, ensure_ascii=False)
+    assert _json.loads(dest.read_text(encoding="utf-8")) == obj
+    ref = io.StringIO()
+    _json.dump(obj, ref, indent=2, ensure_ascii=False)
+    assert dest.read_text(encoding="utf-8") == ref.getvalue()
