@@ -1422,13 +1422,33 @@ class _IgnoreIndex:
     the grouping must not be allowed to reorder anything.
     """
 
-    __slots__ = ("anchors", "meta")
+    __slots__ = ("anchors", "meta", "_by_anchor", "built_to")
 
     def __init__(self, patterns: list[tuple[Path, str]]) -> None:
         # anchor -> (literal_map, glob_list, anchored_list), insertion-ordered.
-        by_anchor: dict[Path, tuple[dict[str, list[int]], list, list]] = {}
+        self._by_anchor: dict[Path, tuple[dict[str, list[int]], list, list]] = {}
         self.meta: dict[int, tuple[bool, bool]] = {}
-        for i, (anchor, pattern) in enumerate(patterns):
+        self.anchors: list = []
+        self.built_to = 0
+        self.ingest(patterns)
+
+    def ingest(self, patterns: list[tuple[Path, str]]) -> None:
+        """Index patterns[self.built_to:], keeping everything already indexed.
+
+        The scan EXTENDS its pattern list as it walks -- every directory with its
+        own .gitignore appends to it (detect.py's walk, and ignored_predicate's
+        ancestor pass). Rebuilding the whole index on each of those re-ran
+        fnmatch.translate + re.compile over every pattern accumulated so far,
+        which is O(dirs x patterns) and, on a repo with a nested ignore file in
+        every directory, cost more than the matching it was meant to accelerate.
+
+        Appending is the only mutation these lists ever see, so new patterns can
+        simply be indexed onto the existing structures. Each pattern keeps its
+        original list index, so last-match-wins is unaffected by when it arrived.
+        """
+        by_anchor = self._by_anchor
+        for i in range(self.built_to, len(patterns)):
+            anchor, pattern = patterns[i]
             negated, directory_only, path_relative, p = _parse_ignore_pattern(pattern)
             if not p:
                 continue  # matches nothing; the old loop `continue`d on this too
@@ -1446,6 +1466,9 @@ class _IgnoreIndex:
                 glob_list.append((i, re.compile(fnmatch.translate(_ncase(p))).match))
             else:
                 literal_map.setdefault(_ncase(p), []).append(i)
+        self.built_to = len(patterns)
+        # Rebuilt rather than appended: one tuple per ANCHOR, and anchors number
+        # in the handful even when patterns number in the thousands.
         self.anchors = [
             (anchor, len(anchor.parts), lit, glob, anch)
             for anchor, (lit, glob, anch) in by_anchor.items()
@@ -1461,8 +1484,18 @@ def _compile_ignore_index(patterns: list[tuple[Path, str]]) -> _IgnoreIndex:
     changing length after its first query would keep a stale index.
     """
     got = _IGNORE_INDEX_CACHE.get(id(patterns))
-    if got is not None and got[0] is patterns and got[1] == len(patterns):
-        return got[2]
+    if got is not None and got[0] is patterns:
+        index = got[2]
+        if got[1] == len(patterns):
+            return index
+        if len(patterns) > got[1]:
+            # Grew since last time -- the common case, since the walk appends a
+            # directory's own .gitignore as it reaches it. Index only the tail.
+            index.ingest(patterns)
+            _IGNORE_INDEX_CACHE[id(patterns)] = (patterns, len(patterns), index)
+            return index
+        # Shrank: something other than append happened, so nothing about the
+        # existing index can be trusted. Fall through and rebuild.
     index = _IgnoreIndex(patterns)
     if len(_IGNORE_INDEX_CACHE) >= _IGNORE_INDEX_CACHE_MAX:
         _IGNORE_INDEX_CACHE.clear()

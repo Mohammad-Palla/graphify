@@ -661,6 +661,7 @@ _SOURCE_KEY_CACHE: dict[tuple[str, str], str] = {}
 def _clear_resolution_caches() -> None:
     """Drop per-run memo state. Called at the top of extract()."""
     _SOURCE_KEY_CACHE.clear()
+    _JS_SOURCE_PATH_CACHE.clear()
 
 
 def _source_key(source_file: str, root: Path) -> str:
@@ -837,16 +838,41 @@ def _is_type_like_definition(node: dict) -> bool:
         return False
     return node.get("file_type") == "code"
 
+# 145,252 calls behind ~15k distinct source files in one cold Bun build. The
+# result is an immutable Path derived only from (source_file, root), so it is
+# memoised rather than rebuilt per call.
+#
+# MUST be cleared per extract() run, like its sibling _SOURCE_KEY_CACHE: the
+# value comes from resolve_cached(), which is filesystem-backed and is itself
+# dropped every run by clear_resolve_cache(). `graphify watch` and the MCP
+# server call extract() repeatedly in ONE process, so a cache that outlives the
+# run re-answers with a path that was resolved through a symlink that no longer
+# exists. That is not a stale-performance problem, it is wrong output: the key
+# stops joining with ensure_symbol_node's live `path.resolve()`, the lookup
+# misses, and a DUPLICATE symbol node is appended while the call edge that
+# should have pointed at the original is lost.
+_JS_SOURCE_PATH_CACHE: dict[tuple[str, str], "Path | None"] = {}
+_JS_SOURCE_PATH_CACHE_MAX = 65536
+
+
 def _js_source_path(source_file: str, root: Path) -> Path | None:
     if not source_file:
         return None
+    key = (source_file, str(root))
+    got = _JS_SOURCE_PATH_CACHE.get(key)
+    if got is not None:
+        return got
     path = Path(source_file)
     if not path.is_absolute():
         path = root / path
     try:
-        return resolve_cached(path)
+        out = resolve_cached(path)
     except Exception:
-        return path
+        out = path
+    if len(_JS_SOURCE_PATH_CACHE) >= _JS_SOURCE_PATH_CACHE_MAX:
+        _JS_SOURCE_PATH_CACHE.clear()
+    _JS_SOURCE_PATH_CACHE[key] = out
+    return out
 
 def _apply_symbol_resolution_facts(
     paths: list[Path],

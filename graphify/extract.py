@@ -11,6 +11,10 @@ import textwrap
 import time
 from collections import Counter
 from dataclasses import dataclass, field
+# Aliased: extract() has a local named `chain` (a barrel-resolution dict), which
+# would otherwise shadow this import for the WHOLE function and make every use
+# an UnboundLocalError.
+from itertools import chain as _chain
 from pathlib import Path, PurePath
 from typing import Any, Callable
 
@@ -3133,12 +3137,23 @@ def _resolve_python_member_calls(
             if alias:
                 import_alias_by_filenode.setdefault(e.get("source"), {})[e.get("target")] = _key(alias)
 
+    _stem_of: dict[str, str] = {}
+
     def _module_stem_key(nid: str) -> str:
         n = node_by_id.get(nid)
         if not n:
             return ""
         sf = n.get("source_file") or ""
-        stem = Path(sf).stem if sf else ""
+        if sf:
+            # str(sf), not sf: PurePath hashes case-INSENSITIVELY on Windows, so
+            # a Path key would merge two files differing only in case. Same rule
+            # the three sibling memos and paths._parent_parts already follow.
+            _sfk = str(sf)
+            stem = _stem_of.get(_sfk)
+            if stem is None:
+                stem = _stem_of[_sfk] = Path(_sfk).stem
+        else:
+            stem = ""
         return _key(stem or n.get("label", ""))
 
     existing_pairs = {(e.get("source"), e.get("target")) for e in all_edges}
@@ -6921,11 +6936,21 @@ def extract(
     # absolute-derived id — which would spuriously fail import evidence and (with
     # the #1659 JS/TS gate below) drop a legitimately-imported call.
     sf_to_file_nid: dict[str, str] = {}
+    # One Path per DISTINCT source_file, not one per node. A repo has ~15k
+    # distinct source files behind ~164k nodes, and pathlib construction was
+    # the single largest cost in the serial phase (689,774 Path() calls).
+    _basename_of: dict[str, str] = {}
     for n in resolution_nodes:
         sf = n.get("source_file")
-        if sf and n.get("label") == Path(str(sf)).name:
-            sf_to_file_nid.setdefault(str(sf), n["id"])
+        if not sf:
+            continue
+        _sfs = str(sf)
+        if _sfs not in _basename_of:
+            _basename_of[_sfs] = Path(_sfs).name
+        if n.get("label") == _basename_of[_sfs]:
+            sf_to_file_nid.setdefault(_sfs, n["id"])
     nid_to_file_nid: dict[str, str] = {}
+    _fallback_file_nid: dict[str, str] = {}
     # nid -> raw source_file string, for the ambiguous-name tie-breakers below
     # (test/non-test classification + path proximity). Kept separate from the
     # file-node-id map because tie-breaking compares the actual file paths.
@@ -6948,13 +6973,20 @@ def extract(
             nid_to_file_nid[n["id"]] = fnid
             continue
         # Fallback (no file node found for this source_file): derive it the old
-        # way from the relativized path.
-        sf_path = Path(sf)
-        try:
-            sf_rel = sf_path.relative_to(root) if sf_path.is_absolute() else sf_path
-        except ValueError:
-            sf_rel = sf_path
-        nid_to_file_nid[n["id"]] = _file_node_id(sf_rel)
+        # way from the relativized path. The derivation depends only on `sf`
+        # and `root`, and root is fixed here, so the whole result -- Path
+        # construction, relative_to, and _file_node_id -- is memoised per
+        # distinct source_file rather than recomputed per node.
+        _sfs = str(sf)
+        _fallback = _fallback_file_nid.get(_sfs)
+        if _fallback is None:
+            sf_path = Path(_sfs)
+            try:
+                sf_rel = sf_path.relative_to(root) if sf_path.is_absolute() else sf_path
+            except ValueError:
+                sf_rel = sf_path
+            _fallback = _fallback_file_nid[_sfs] = _file_node_id(sf_rel)
+        nid_to_file_nid[n["id"]] = _fallback
 
     existing_pairs = {(e["source"], e["target"]) for e in all_edges}
     # Call-like pairs only, for the indirect_call dedup: an `imports` edge from a
@@ -7260,14 +7292,23 @@ def extract(
         _sf_forms[sf] = entry
         return entry
 
-    for item in all_nodes + all_edges:
+    # chain() rather than `all_nodes + all_edges`: the concatenation copied a
+    # 547,130-element list purely to iterate it once. Path() is memoised per
+    # distinct source_file for the same reason as above -- _sf_entry already
+    # caches on `sf`, but the Path was being built before that cache was
+    # consulted, so the memo was doing nothing for the expensive part.
+    _sf_paths: dict[str, Path] = {}
+    for item in _chain(all_nodes, all_edges):
         sf = item.get("source_file")
         if not sf:
             continue
-        sf_path = Path(sf)
+        _sfs = str(sf)
+        sf_path = _sf_paths.get(_sfs)
+        if sf_path is None:
+            sf_path = _sf_paths[_sfs] = Path(_sfs)
         if not sf_path.is_absolute():
             continue
-        new_sf, canonical_id, keys = _sf_entry(str(sf), sf_path)
+        new_sf, canonical_id, keys = _sf_entry(_sfs, sf_path)
         if "id" in item:
             for key in keys:
                 if key == canonical_id or key in ext_id_remap:
@@ -7379,7 +7420,7 @@ def extract(
     # PurePath is the NATIVE flavour on purpose: on POSIX a backslash is a legal
     # filename character and must be left alone, so this only rewrites paths on
     # the platform where `\` is actually a separator.
-    for _item in (*all_nodes, *all_edges):
+    for _item in _chain(all_nodes, all_edges):
         _sf = _item.get("source_file")
         if _sf and "\\" in str(_sf):
             _item["source_file"] = PurePath(_sf).as_posix()
