@@ -70,6 +70,10 @@ def _both(tmp_path, source: str, name: str = "m.py"):
     items = native.pop("py_rationale", None)
     assert items is not None, "rationale payload deferred; this test proves nothing"
     _apply_python_rationale_native(p, native, items)
+    # Raw material for phase 3's cross-file pass, consumed in the parent and never
+    # part of the graph. The control arm has no counterpart; `_xfile_both` below
+    # compares it where it matters, at that pass's boundary.
+    native.pop("py_xfile", None)
 
     with _seam_disabled():
         py = _extract_generic(p, _PYTHON_CONFIG)
@@ -160,7 +164,9 @@ def test_form_feed_defers_the_rationale_payload_only(tmp_path):
     assert native is not None, f"the whole file must not defer, only its rationale ({reason})"
     assert "py_rationale" not in native, "the rationale payload must defer on a form feed"
     # And the end-to-end result must still match, via the Python fallback.
-    assert _canon(extract_python(p)) == _canon(_fallback(p))
+    got = extract_python(p)
+    got.pop("py_xfile", None)   # phase-3 raw material; the control has no counterpart
+    assert _canon(got) == _canon(_fallback(p))
 
 
 def _fallback(p):
@@ -186,3 +192,110 @@ def test_relative_import_resolution_matches(tmp_path):
     assert any("target_file" not in e for e in targets.values()), (
         "the unresolvable one must stay dangling, not be stamped speculatively"
     )
+
+
+# ── cross-file import fusion (`py_xfile`) ────────────────────────────────────
+#
+# `_resolve_cross_file_imports` is compared here at the PASS boundary: the same
+# per-file results, once with the kernel's payload and once with it stripped so
+# the original parse-and-walk path runs. The whole-graph gate
+# (`harness/kernel_graph_ab.py`) covers what this cannot -- a payload that goes
+# stale before phase 3 reads it -- and these cover what the corpora cannot reach.
+
+def _xfile_both(tmp_path, files: dict[str, str]):
+    """(native, python) edge lists from `_resolve_cross_file_imports`."""
+    from graphify.extractors.resolution import _resolve_cross_file_imports
+
+    paths = []
+    for name, body in files.items():
+        p = tmp_path / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body)
+        paths.append(p)
+
+    per_file = [extract_python(p) for p in paths]
+    assert any("py_xfile" in r for r in per_file), (
+        "no file produced a py_xfile payload; this test proves nothing"
+    )
+    native = _resolve_cross_file_imports(per_file, paths)
+    stripped = [{k: v for k, v in r.items() if k != "py_xfile"} for r in per_file]
+    with _seam_disabled():
+        py = _resolve_cross_file_imports(stripped, paths)
+    return native, py
+
+
+def test_module_name_falls_through_to_the_imported_name(tmp_path):
+    """The quirk django cannot reach: `resolve_import`'s loop keeps trying LATER
+    `dotted_name` children when an earlier one does not resolve.
+
+    The imported names are themselves direct `dotted_name` children, and the
+    secondary index is keyed by FILE stem -- so `from unknownmod import Client`,
+    with no `unknownmod` in the index but a `Client.py` present, resolves the
+    import target to `Client.py`. Surprising, but it is the behaviour, and a
+    walker that emitted only the first candidate would silently drop the edge.
+    Injecting exactly that simplification changed NOTHING on django's 2,929
+    files, which is why this test exists.
+    """
+    native, py = _xfile_both(tmp_path, {
+        "Client.py": "class Client:\n    pass\n",
+        "user.py": (
+            "from unknownmod import Client\n"
+            "class Service:\n"
+            "    def go(self):\n"
+            "        return Client()\n"
+        ),
+    })
+    assert _canon(native) == _canon(py)
+    assert native, (
+        "the fall-through produced no edge at all, so this test would pass even "
+        "with the fall-through removed"
+    )
+
+
+def test_relative_import_wins_over_an_earlier_candidate(tmp_path):
+    """A `relative_import` stops the scan and overrides any candidate collected
+    before it -- the Python `break`s the outer loop after setting `target_fq`."""
+    native, py = _xfile_both(tmp_path, {
+        "models.py": "class Thing:\n    pass\n",
+        "views.py": (
+            "from .models import Thing\n"
+            "class View:\n"
+            "    def get(self):\n"
+            "        return Thing()\n"
+        ),
+    })
+    assert _canon(native) == _canon(py)
+    assert any(e["relation"] == "uses" for e in native), "expected a cross-file uses edge"
+
+
+def test_aliased_import_attributes_to_the_local_name(tmp_path):
+    """`from m import A as B` resolves the target through A but the body
+    references B, so `refs` must be keyed on the LOCAL name."""
+    native, py = _xfile_both(tmp_path, {
+        "m.py": "class Alpha:\n    pass\n",
+        "u.py": (
+            "from .m import Alpha as Beta\n"
+            "def use():\n"
+            "    return Beta()\n"
+        ),
+    })
+    assert _canon(native) == _canon(py)
+    assert any(e["relation"] == "uses" for e in native), "the alias reference was lost"
+
+
+def test_reference_line_is_the_first_occurrence(tmp_path):
+    """`ref_sources` uses `setdefault`, so the FIRST line a symbol references the
+    name wins. Emitting the last would move every such edge's source_location."""
+    native, py = _xfile_both(tmp_path, {
+        "m.py": "class Alpha:\n    pass\n",
+        "u.py": (
+            "from .m import Alpha\n"
+            "def use():\n"
+            "    x = Alpha()\n"
+            "    y = Alpha()\n"
+            "    return x, y\n"
+        ),
+    })
+    assert _canon(native) == _canon(py)
+    locs = {e["source_location"] for e in native if e["relation"] == "uses"}
+    assert locs == {"L3"}, f"expected the first reference line only, got {locs}"

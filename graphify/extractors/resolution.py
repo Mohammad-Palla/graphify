@@ -2189,6 +2189,81 @@ def _augment_symbol_resolution_edges(
           f"alias={len(facts.aliases)} exp={len(facts.exports)} uses={len(facts.uses)}",
           flush=True)
 
+def _xfile_edges_from_native(
+    native: dict,
+    path: Path,
+    str_path: str,
+    name_to_nid: dict[str, str],
+    stem_to_entities: dict[str, dict[str, str]],
+    bare_to_qualified: dict[str, str],
+) -> list[dict]:
+    """`_resolve_cross_file_imports`' pass 2, from the kernel's payload.
+
+    The walker supplies `imports` (each statement's candidate module names, in the
+    order the Python tries them, plus its `(imported, local)` pairs) and `refs`
+    (`local name -> [(owning top-level nid, first line)]`). Everything that needs
+    the corpus -- `stem_to_entities`, `bare_to_qualified` -- or pathlib --
+    `path.parent`, `_file_stem` -- happens here, because a worker has neither.
+
+    `refs` is restricted to names this file's from-imports bind. That is exact,
+    not a shortcut: the loop below only ever reads `ref_sources` at those keys, so
+    every other entry the Python built was discarded unread.
+
+    The owners arrive as symbol NAMES, not ids. This pass runs after `id_remap`
+    and `disambiguate_ids`, so a phase-2 id is stale by the time it gets here --
+    emitting them produced 16 wrong edges on django, which no per-file or
+    pass-level check could see and only a full graph comparison caught.
+
+    Order is preserved deliberately. `import_targets` is a dict built in statement
+    order, and re-binding an existing local name updates the value while keeping
+    its original position -- which the plain assignment below reproduces.
+    """
+    import_targets: dict[str, str] = {}
+    for relative, bares, pairs in native.get("imports") or []:
+        target_fq: str | None = None
+        if relative:
+            # Only the first dotted_name inside the relative_import is used, and
+            # the result is NOT checked against the bare-stem index.
+            if bares:
+                target_fq = _file_stem(path.parent / f"{bares[0]}.py")
+        else:
+            for bare in bares:
+                target_fq = bare_to_qualified.get(bare)
+                if target_fq is not None:
+                    break
+        if not target_fq or target_fq not in stem_to_entities:
+            continue
+        entities = stem_to_entities[target_fq]
+        for imported_name, local_name in pairs:
+            tgt_nid = entities.get(imported_name)
+            if tgt_nid:
+                import_targets[local_name] = tgt_nid
+
+    if not import_targets:
+        return []
+    ref_sources = {name: entries for name, entries in (native.get("refs") or [])}
+
+    out: list[dict] = []
+    for name, tgt_nid in import_targets.items():
+        for owner, line in ref_sources.get(name, ()):
+            src_nid = name_to_nid.get(owner)
+            # A name the walker saw but this pass's node set no longer carries:
+            # the Python would never have set `current_nid` for it, so no edge.
+            if src_nid is None or src_nid == tgt_nid:
+                continue
+            out.append({
+                "source": src_nid,
+                "target": tgt_nid,
+                "relation": "uses",
+                "confidence": "INFERRED",
+                "confidence_score": 0.95,
+                "source_file": str_path,
+                "source_location": f"L{line}",
+                "weight": 0.8,
+            })
+    return out
+
+
 def _resolve_cross_file_imports(
     per_file: list[dict],
     paths: list[Path],
@@ -2257,6 +2332,13 @@ def _resolve_cross_file_imports(
     for file_result, path in zip(per_file, paths):
         str_path = str(path)
 
+        # The native walker already parsed this file in phase 2 and can hand back
+        # the two per-file intermediates below, which is the whole cost of this
+        # pass: 2,016 tree-sitter parses and a 4.27M-call Python walk, on the
+        # SERIAL spine. Corpus-wide resolution stays here -- a worker sees one
+        # file and cannot know `stem_to_entities`.
+        native = file_result.get("py_xfile")
+
         # Map each local symbol (class or function) to its node id, keyed by the
         # bare symbol name. Function labels end in "()"; the file node ends in
         # ".py"; rationale nodes never import (#563). First writer wins on a
@@ -2272,6 +2354,21 @@ def _resolve_cross_file_imports(
             if sym_name and sym_name not in name_to_nid:
                 name_to_nid[sym_name] = n["id"]
         if not name_to_nid:
+            continue
+
+        # The native walker already parsed this file in phase 2 and can supply the
+        # two per-file intermediates below -- which is the whole cost of this pass:
+        # 2,016 tree-sitter parses and a 4.27M-call Python walk, on the SERIAL
+        # spine. `name_to_nid` is still built here, and deliberately: this pass
+        # runs AFTER id_remap and disambiguate_ids, so the ids in `file_result`
+        # are post-remap while anything phase 2 emitted is not. The payload
+        # therefore carries symbol NAMES, which the remap leaves alone, and they
+        # are resolved through the map just built.
+        if native is not None:
+            new_edges.extend(
+                _xfile_edges_from_native(native, path, str_path, name_to_nid,
+                                         stem_to_entities, bare_to_qualified)
+            )
             continue
 
         # Parse imports from this file

@@ -49,6 +49,7 @@ pub mod helpers;
 pub mod imports;
 pub mod rationale;
 pub mod walk;
+pub mod xfile;
 
 /// See `js::MAX_DEPTH`. Same reasoning, same bound: a Rust stack overflow is a
 /// SIGSEGV that takes the whole pool worker down, where Python raises a catchable
@@ -377,6 +378,18 @@ fn extract<'py>(
             out.set_item("py_rationale", payload).map_err(|_| "py_error")?;
         }
         Err(_reason) => { /* rationale defers; Python collects it for this file */ }
+    }
+
+    // Cross-file import material, from THIS parse. Without it
+    // `_resolve_cross_file_imports` parses and walks every Python file a THIRD
+    // time, in the serial parent -- 7.1s of django's phase 3. A third separate
+    // deferral axis, for the same reason as the other two.
+    match xfile::collect(&ctx, root) {
+        Ok(x) => {
+            let payload = xfile::to_py(py, &x).map_err(|_| "py_error")?;
+            out.set_item("py_xfile", payload).map_err(|_| "py_error")?;
+        }
+        Err(_reason) => { /* xfile defers; the parent parses this file itself */ }
     }
     Ok(out)
 }
