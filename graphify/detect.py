@@ -1283,6 +1283,13 @@ def _parse_ignore_pattern(pattern: str) -> tuple[bool, bool, bool, str]:
 # exactly, but skip the normcase pass entirely where it is a no-op (POSIX).
 _CASEFOLD_PATHS = os.path.normcase("Aa") != "Aa"
 
+# fnmatch normcases both of its arguments; mirror that when pre-compiling and
+# when building candidate strings, and skip it where it is a no-op (POSIX).
+_ncase = os.path.normcase if _CASEFOLD_PATHS else (lambda s: s)
+
+# A pattern free of these is, for fnmatch, plain equality after normcase.
+_GLOB_META = frozenset("*?[")
+
 
 def _lexical_relative(
     target: Path, target_parts: tuple[str, ...], anchor: Path
@@ -1383,6 +1390,86 @@ def _match_anchored_ignore_pattern(path: str, pattern: str) -> bool:
     return _match_globstar_parts(path_parts, pattern_parts, 0, 0, {})
 
 
+# Compiled ignore-pattern indexes, keyed by the identity of the pattern list they
+# were built from. A scan builds its list once in `ignored_predicate`/`detect` and
+# then asks about tens of thousands of paths, so the compile is amortized to
+# nothing -- but the entry is only reused when it is the SAME list object of the
+# SAME length, and the list is held so its id cannot be recycled under us.
+_IGNORE_INDEX_CACHE: dict[int, tuple[list[tuple[Path, str]], int, "_IgnoreIndex"]] = {}
+_IGNORE_INDEX_CACHE_MAX = 32
+
+
+class _IgnoreIndex:
+    """One ignore-pattern list, pre-grouped by anchor and pre-compiled.
+
+    The previous shape ran ``fnmatch.fnmatch`` for every pattern against every
+    candidate string of every path. On a 20k-file corpus with 196 patterns that
+    is 28 MILLION fnmatch calls -- 86% of detect()'s entire runtime -- and none
+    of that work varies per path, so all of it is hoisted here:
+
+    * A plain pattern containing no glob metacharacter is, for fnmatch, exact
+      string equality after normcase. Those become ONE dict lookup per candidate
+      string instead of one fnmatch per pattern per candidate. Most patterns are
+      of this kind (130 of Bun's 196).
+    * A plain pattern that does glob is compiled to a regex once. fnmatch would
+      otherwise normcase BOTH arguments and re-look-up its own cache on every
+      call -- 56M normcase calls on the same corpus.
+    * Patterns are grouped by anchor so the anchor-relative path is derived once
+      per anchor instead of once per pattern.
+
+    Each pattern keeps its original index in the list, because gitignore is
+    last-match-wins: the answer depends on which matching pattern came last, so
+    the grouping must not be allowed to reorder anything.
+    """
+
+    __slots__ = ("anchors", "meta")
+
+    def __init__(self, patterns: list[tuple[Path, str]]) -> None:
+        # anchor -> (literal_map, glob_list, anchored_list), insertion-ordered.
+        by_anchor: dict[Path, tuple[dict[str, list[int]], list, list]] = {}
+        self.meta: dict[int, tuple[bool, bool]] = {}
+        for i, (anchor, pattern) in enumerate(patterns):
+            negated, directory_only, path_relative, p = _parse_ignore_pattern(pattern)
+            if not p:
+                continue  # matches nothing; the old loop `continue`d on this too
+            group = by_anchor.get(anchor)
+            if group is None:
+                group = ({}, [], [])
+                by_anchor[anchor] = group
+            literal_map, glob_list, anchored_list = group
+            self.meta[i] = (negated, directory_only)
+            if path_relative:
+                # Anchored patterns go through _match_anchored_ignore_pattern,
+                # which forbids `*` from crossing `/`. Left exactly as it was.
+                anchored_list.append((i, p))
+            elif _GLOB_META.intersection(p):
+                glob_list.append((i, re.compile(fnmatch.translate(_ncase(p))).match))
+            else:
+                literal_map.setdefault(_ncase(p), []).append(i)
+        self.anchors = [
+            (anchor, len(anchor.parts), lit, glob, anch)
+            for anchor, (lit, glob, anch) in by_anchor.items()
+        ]
+
+
+def _compile_ignore_index(patterns: list[tuple[Path, str]]) -> _IgnoreIndex:
+    """The compiled index for `patterns`, built once and reused for the scan.
+
+    The identity-and-length guard assumes what the callers actually do: build the
+    list, finish appending to it (detect() appends --exclude patterns before the
+    walk starts), then only read it. A list that were mutated in place without
+    changing length after its first query would keep a stale index.
+    """
+    got = _IGNORE_INDEX_CACHE.get(id(patterns))
+    if got is not None and got[0] is patterns and got[1] == len(patterns):
+        return got[2]
+    index = _IgnoreIndex(patterns)
+    if len(_IGNORE_INDEX_CACHE) >= _IGNORE_INDEX_CACHE_MAX:
+        _IGNORE_INDEX_CACHE.clear()
+    _IGNORE_INDEX_CACHE[id(patterns)] = (patterns, len(patterns), index)
+    return index
+
+
 def _is_ignored(
     path: Path,
     root: Path,
@@ -1407,17 +1494,19 @@ def _is_ignored(
         return False
 
     root_nparts = len(root.parts)
+    index = _compile_ignore_index(patterns)
 
     def _eval(target: Path) -> bool:
         """Apply last-match-wins to a single target path.
 
-        Everything derivable from ``target`` alone — its parts, its relative
-        path per anchor, the root-relative path, the split segments and their
-        "/"-joined prefixes, the NFC name, the is_dir() stat — is computed at
+        Everything derivable from ``target`` alone -- its parts, its relative
+        path per anchor, the root-relative path, the candidate strings a plain
+        pattern may match, the NFC name, the is_dir() stat -- is computed at
         most ONCE per call, no matter how many patterns are evaluated. The
-        previous shape rebuilt pathlib objects (``relative_to``) and re-split
+        original shape rebuilt pathlib objects (``relative_to``) and re-split
         strings per PATTERN per entry, which pinned real scans for tens of
-        minutes (see CHANGELOG).
+        minutes (see CHANGELOG); this shape additionally stops re-running
+        fnmatch per pattern per candidate, which was 86% of a cold detect().
         """
         if _cache is not None and target in _cache:
             return _cache[target]
@@ -1427,81 +1516,78 @@ def _is_ignored(
         target_is_dir: bool | None = None
         rel_root_known = False
         rel_root: str | None = None
-        # rel string (or None = outside anchor) and part-count per distinct
-        # anchor; patterns overwhelmingly share a handful of anchors.
-        rel_by_anchor: dict[Path, tuple[str | None, int]] = {}
-        # split segments + accumulated "/" prefixes per distinct rel string.
-        segs_by_rel: dict[str, tuple[list[str], list[str]]] = {}
 
-        def _segments(rel: str) -> tuple[list[str], list[str]]:
-            got = segs_by_rel.get(rel)
-            if got is None:
-                parts = rel.split("/")
-                prefixes: list[str] = []
-                acc = ""
-                for part in parts:
-                    acc = part if not acc else acc + "/" + part
-                    prefixes.append(acc)
-                got = (parts, prefixes)
-                segs_by_rel[rel] = got
-            return got
+        # Indices of every pattern that matches, collected across anchors and
+        # then replayed in list order: gitignore is last-match-wins, so the
+        # per-anchor grouping must not be allowed to change the verdict.
+        matched: set[int] = set()
 
-        def _matches(rel: str, p: str, path_relative: bool) -> bool:
-            nonlocal target_name_nfc
-            if path_relative:
-                return _match_anchored_ignore_pattern(rel, p)
-            if fnmatch.fnmatch(rel, p):
-                return True
-            if target_name_nfc is None:
-                target_name_nfc = _nfc(target.name)
-            if fnmatch.fnmatch(target_name_nfc, p):
-                return True
-            parts, prefixes = _segments(rel)
-            for part, prefix in zip(parts, prefixes):
-                if fnmatch.fnmatch(part, p):
-                    return True
-                if fnmatch.fnmatch(prefix, p):
-                    return True
-            return False
-
-        result = False
-        for anchor, pattern in patterns:
-            negated, directory_only, path_relative, p = _parse_ignore_pattern(pattern)
-            if not p:
-                continue
-
+        for anchor, anchor_nparts, literal_map, glob_list, anchored_list in index.anchors:
             # gitignore semantics: patterns from A/.gitignore apply ONLY to paths
             # under A. Matching non-anchored patterns against root-relative paths
             # let e.g. .hypothesis/.gitignore's bare "*" ignore the ENTIRE repo
-            # (detect() returned 0 files). The anchor dir itself is exempt — an
+            # (detect() returned 0 files). The anchor dir itself is exempt -- an
             # ignore file governs its directory's contents, not the directory.
-            cached_rel = rel_by_anchor.get(anchor)
-            if cached_rel is None:
-                cached_rel = (
-                    _lexical_relative(target, target_parts, anchor),
-                    len(anchor.parts),
-                )
-                rel_by_anchor[anchor] = cached_rel
-            rel_anchor, anchor_nparts = cached_rel
+            rel_anchor = _lexical_relative(target, target_parts, anchor)
             if rel_anchor is None:
-                continue  # target outside this pattern's anchor: cannot match
-            matched = False
-            if rel_anchor != ".":
-                rel = rel_anchor
-                if not path_relative and root_nparts > anchor_nparts:
-                    if not rel_root_known:
-                        rel_root_known = True
-                        rel_root = _lexical_relative(target, target_parts, root)
-                    if rel_root is not None:
-                        rel = rel_root
-                matched = _matches(rel, p, path_relative=path_relative)
-                if matched and directory_only:
+                continue  # target outside this anchor: none of its patterns can match
+            if rel_anchor == ".":
+                continue  # the anchor directory itself never matches its own patterns
+
+            if anchored_list:
+                for i, pat in anchored_list:
+                    if _match_anchored_ignore_pattern(rel_anchor, pat):
+                        matched.add(i)
+
+            if not literal_map and not glob_list:
+                continue
+
+            # Plain (non-path-relative) patterns match against the ROOT-relative
+            # path when the anchor sits above the root, exactly as before.
+            rel = rel_anchor
+            if root_nparts > anchor_nparts:
+                if not rel_root_known:
+                    rel_root_known = True
+                    rel_root = _lexical_relative(target, target_parts, root)
+                if rel_root is not None:
+                    rel = rel_root
+
+            # The candidate strings a plain pattern is tested against: the
+            # relative path, the NFC name, and every path segment and every
+            # accumulated "/"-prefix. (The name is always the final segment and
+            # the path is always the final prefix, so both are already covered
+            # -- they are listed anyway because `name` uses the NFC form, which
+            # a decomposed filename makes distinct.)
+            if target_name_nfc is None:
+                target_name_nfc = _nfc(target.name)
+            candidates = {_ncase(rel), _ncase(target_name_nfc)}
+            acc = ""
+            for part in rel.split("/"):
+                acc = part if not acc else acc + "/" + part
+                candidates.add(_ncase(part))
+                candidates.add(_ncase(acc))
+
+            if literal_map:
+                for cand in candidates:
+                    hit = literal_map.get(cand)
+                    if hit is not None:
+                        matched.update(hit)
+            for i, rx in glob_list:
+                for cand in candidates:
+                    if rx(cand):
+                        matched.add(i)
+                        break
+
+        result = False
+        if matched:
+            meta = index.meta
+            for i in sorted(matched):
+                negated, directory_only = meta[i]
+                if directory_only:
                     if target_is_dir is None:
                         target_is_dir = target.is_dir()
                     if not target_is_dir:
-                        matched = False
-
-            if matched:
+                        continue  # a dir-only pattern cannot match a file
                 result = not negated  # last match wins; ! flips to un-ignore
         if _cache is not None:
             _cache[target] = result
