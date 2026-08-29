@@ -1517,13 +1517,24 @@ def _collect_js_facts_one_file(path: Path) -> "tuple[_SymbolResolutionFacts, _Sy
         node_type = node.type
         line = node.start_point[0] + 1
 
-        # Any node type can introduce a lexical alias, so this stays
-        # unconditional and FIRST — the branches below use `continue` for
-        # control flow and would otherwise skip it.
-        for alias, target in _js_lexical_aliases(node, source):
-            facts.aliases.append(
-                _SymbolAliasFact(path, alias, target, line)
-            )
+        # Only a `lexical_declaration` can introduce an alias -- that is the
+        # first thing `_js_lexical_aliases` tests, returning [] for everything
+        # else. Testing it HERE instead is byte-identical and skips a function
+        # call plus a list allocation on every other node in the file: measured
+        # 13.3% of this collector's total cost across 1,500 Bun files, to find
+        # 239 aliases among 1,997,116 nodes.
+        #
+        # It still runs FIRST, before the branches below, because they use
+        # `continue` for control flow and an `export_statement` wrapping a
+        # `lexical_declaration`... does NOT reach here as a lexical_declaration
+        # itself -- the walk visits the inner node separately, so ordering within
+        # this loop is what preserves the fact order, not the position of the
+        # test.
+        if node_type == "lexical_declaration":
+            for alias, target in _js_lexical_aliases(node, source):
+                facts.aliases.append(
+                    _SymbolAliasFact(path, alias, target, line)
+                )
 
         if node_type == "import_statement":
             raw_module = _js_module_specifier(node, source)
@@ -1773,6 +1784,7 @@ def _collect_file_symbol_facts(
     collect_one,
     parallel: bool = True,
     max_workers: "int | None" = None,
+    precomputed: "dict[Path, tuple] | None" = None,
 ) -> None:
     """Collect one language's per-file symbol facts into ``facts``.
 
@@ -1801,16 +1813,36 @@ def _collect_file_symbol_facts(
     if not selected:
         return
 
+    precomputed = precomputed or {}
+    # Only files the extraction pass did NOT already answer for need collecting.
+    outstanding = [path for path in selected if path not in precomputed]
+
     workers = None
-    if parallel and len(selected) >= _FACTS_PARALLEL_THRESHOLD:
-        workers = _facts_pool_workers(selected, max_workers)
+    if parallel and len(outstanding) >= _FACTS_PARALLEL_THRESHOLD:
+        workers = _facts_pool_workers(outstanding, max_workers)
     if workers is not None:
         # Merge into a scratch so a pool that dies mid-iteration leaves `facts`
         # untouched and the serial retry below cannot double-append.
         scratch = _SymbolResolutionFacts()
         deferred_scratch = _SymbolResolutionFacts()
         try:
-            for file_facts, deferred in _map_facts_parallel(collect_one, selected, workers):
+            # Enumerate the generator; do NOT `zip` it with `outstanding`.
+            # `zip` pulls from its first argument first, so when that list is
+            # exhausted it stops WITHOUT drawing the generator's final
+            # StopIteration -- the generator is then closed by garbage
+            # collection, which raises GeneratorExit inside it, trips its
+            # `except BaseException` and shuts the pool down with
+            # `wait=False, cancel_futures=True` as though the user had
+            # interrupted. A clean run would stop waiting for its own workers.
+            computed = {}
+            for _i, _pair in enumerate(
+                _map_facts_parallel(collect_one, outstanding, workers)
+            ):
+                computed[outstanding[_i]] = _pair
+            # Iterate `selected`, not `computed`: the merged lists must stay in
+            # corpus order regardless of which side produced each file's facts.
+            for path in selected:
+                file_facts, deferred = precomputed.get(path) or computed[path]
                 _merge_symbol_facts(scratch, file_facts)
                 _merge_symbol_facts(deferred_scratch, deferred)
             _merge_symbol_facts(facts, scratch)
@@ -1836,7 +1868,7 @@ def _collect_file_symbol_facts(
 
     deferred_all = _SymbolResolutionFacts()
     for path in selected:
-        file_facts, deferred = collect_one(path)
+        file_facts, deferred = precomputed.get(path) or collect_one(path)
         _merge_symbol_facts(facts, file_facts)
         _merge_symbol_facts(deferred_all, deferred)
     _merge_symbol_facts(facts, deferred_all)
@@ -1848,6 +1880,7 @@ def _collect_js_symbol_resolution_facts(
     *,
     parallel: bool = True,
     max_workers: "int | None" = None,
+    precomputed: "dict[Path, tuple] | None" = None,
 ) -> None:
     _collect_file_symbol_facts(
         paths,
@@ -1856,6 +1889,7 @@ def _collect_js_symbol_resolution_facts(
         collect_one=_collect_js_facts_one_file,
         parallel=parallel,
         max_workers=max_workers,
+        precomputed=precomputed,
     )
 
 
@@ -2101,18 +2135,20 @@ def _augment_symbol_resolution_edges(
     *,
     parallel: bool = True,
     max_workers: "int | None" = None,
+    precomputed_js_facts: "dict[Path, tuple] | None" = None,
 ) -> None:
     facts = _SymbolResolutionFacts()
     _pool = {"parallel": parallel, "max_workers": max_workers}
+    _js_pool = dict(_pool, precomputed=precomputed_js_facts)
     if not _AUGMENT_PROFILE:
-        _collect_js_symbol_resolution_facts(paths, facts, **_pool)
+        _collect_js_symbol_resolution_facts(paths, facts, **_js_pool)
         _collect_python_symbol_resolution_facts(paths, root, facts, **_pool)
         _apply_symbol_resolution_facts(paths, nodes, edges, root, facts)
         return
 
     import time as _time
     _t = _time.perf_counter()
-    _collect_js_symbol_resolution_facts(paths, facts, **_pool)
+    _collect_js_symbol_resolution_facts(paths, facts, **_js_pool)
     _js = _time.perf_counter() - _t
     _t = _time.perf_counter()
     _collect_python_symbol_resolution_facts(paths, root, facts, **_pool)

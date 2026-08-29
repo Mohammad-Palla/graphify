@@ -48,6 +48,7 @@ use crate::Outcome;
 pub mod ast;
 pub mod calls;
 pub mod emit;
+pub mod facts;
 pub mod imports;
 pub mod pat;
 pub mod walk;
@@ -432,6 +433,22 @@ fn extract<'py>(
     out.set_item("nodes", nodes).map_err(|_| "py_error")?;
     out.set_item("edges", edges).map_err(|_| "py_error")?;
     out.set_item("raw_calls", raw_calls).map_err(|_| "py_error")?;
+
+    // Symbol-resolution facts, from THIS parse. Phase 3's `collect_js` re-parses
+    // every JS/TS file to build these -- 2.07 tree-sitter parses per file across
+    // a build -- so emitting them here is what removes the second parse.
+    //
+    // A SEPARATE deferral axis: a construct the fact collector has no rule for
+    // omits the key and Python's collector runs for that file alone, while the
+    // nodes and edges above still come from here. Coupling the two would let a
+    // gap in either cost the speedup of both.
+    match facts::collect(&ctx, root) {
+        Ok((f, class_members)) => {
+            let payload = facts::to_py(py, &f, &class_members).map_err(|_| "py_error")?;
+            out.set_item("js_symbol_facts", payload).map_err(|_| "py_error")?;
+        }
+        Err(_reason) => { /* facts defer; Python collects them for this file */ }
+    }
 
     // The receiver table is a SEPARATE full-tree pass in Python, run after the
     // walk, and its constructor-injection entries (populated during the walk)

@@ -59,7 +59,7 @@ def _fake_kernel(*, languages=(), tree_sitter_ok=True, extract=None, version="0.
     # The real signature: `(result, defer_reason)`, exactly one of them non-None,
     # plus the import-resolver callback the walker calls back into.
     mod.extract_file = (extract if extract is not None
-                        else (lambda p, s, l, r=None: (None, "fake")))
+                        else (lambda p, s, l, r=None, m=None: (None, "fake")))
     return mod
 
 
@@ -159,7 +159,7 @@ def test_unknown_grammar_never_reaches_the_kernel(monkeypatch):
 def test_walker_exception_is_a_deferral_not_a_build_failure(monkeypatch, tmp_path):
     monkeypatch.delenv("GRAPHIFY_KERNEL", raising=False)
 
-    def _explode(path, source, language, resolve_import=None):
+    def _explode(path, source, language, resolve_import=None, resolve_module=None):
         raise ValueError("walker bug")
 
     _install(monkeypatch, _fake_kernel(languages=("typescript",), extract=_explode))
@@ -174,7 +174,7 @@ def test_native_result_is_returned_and_counted(monkeypatch, tmp_path):
     payload = {"nodes": [{"id": "n"}], "edges": []}
     _install(monkeypatch, _fake_kernel(
         languages=("typescript",),
-        extract=lambda p, s, l, r=None: (payload, None)))
+        extract=lambda p, s, l, r=None, m=None: (payload, None)))
     f = tmp_path / "a.ts"
     f.write_bytes(b"const x = 1;")
     assert kernel.try_extract(f, _Cfg()) is payload
@@ -186,7 +186,7 @@ def test_source_override_is_honoured(monkeypatch, tmp_path):
     monkeypatch.delenv("GRAPHIFY_KERNEL", raising=False)
     seen: dict = {}
 
-    def _capture(path, source, language, resolve_import=None):
+    def _capture(path, source, language, resolve_import=None, resolve_module=None):
         seen["source"] = source
         return ({"nodes": [], "edges": []}, None)
 
@@ -214,7 +214,7 @@ def test_real_rust_panic_is_a_deferral(monkeypatch, tmp_path):
         pytest.skip("kernel predates the debug_panic hook")
     monkeypatch.delenv("GRAPHIFY_KERNEL", raising=False)
 
-    def _panic(path, source, language, resolve_import=None):
+    def _panic(path, source, language, resolve_import=None, resolve_module=None):
         real.debug_panic()
 
     _install(monkeypatch, _fake_kernel(languages=("typescript",), extract=_panic))
@@ -230,7 +230,7 @@ def test_interrupts_are_not_swallowed(monkeypatch, tmp_path, exc):
     responding to it (the defect fixed in d0edc4d)."""
     monkeypatch.delenv("GRAPHIFY_KERNEL", raising=False)
 
-    def _interrupt(path, source, language, resolve_import=None):
+    def _interrupt(path, source, language, resolve_import=None, resolve_module=None):
         raise exc()
 
     _install(monkeypatch, _fake_kernel(languages=("typescript",), extract=_interrupt))
@@ -246,7 +246,7 @@ def test_deferral_is_counted_by_reason(monkeypatch, tmp_path):
     monkeypatch.delenv("GRAPHIFY_KERNEL", raising=False)
     _install(monkeypatch, _fake_kernel(
         languages=("typescript",),
-        extract=lambda p, s, l, r=None: (None, "decorator")))
+        extract=lambda p, s, l, r=None, m=None: (None, "decorator")))
     f = tmp_path / "a.ts"
     f.write_bytes(b"const x = 1;")
     assert kernel.try_extract(f, _Cfg()) is None
@@ -266,7 +266,7 @@ def test_grammar_mismatch_drops_the_language(monkeypatch, tmp_path):
     monkeypatch.delenv("GRAPHIFY_KERNEL", raising=False)
     called: list = []
 
-    def _extract(path, source, language, resolve_import=None):
+    def _extract(path, source, language, resolve_import=None, resolve_module=None):
         called.append(path)
         return ({"nodes": [], "edges": []}, None)
 
@@ -366,5 +366,15 @@ def test_extraction_is_identical_with_and_without_the_kernel(tmp_path):
         os.environ.pop("GRAPHIFY_KERNEL", None)
         kernel.reset_for_test()
 
+    # `js_symbol_facts` is the ONE documented asymmetry: the native path also
+    # emits phase 3's symbol-resolution facts from the parse it already did, so
+    # that `collect_js` does not re-parse the file (a full build called
+    # tree-sitter's `parse()` 2.07 times per JS/TS-family file before this). It is
+    # a memo of work done later, not part of the graph, and its own equivalence is
+    # gated by `harness/kernel_facts_parity.py` (DIVERGENT 0 over 11,868 files)
+    # plus the cold graph gate. Everything that reaches the graph must still match
+    # exactly.
+    assert set(with_kernel) - set(without_kernel) <= {"js_symbol_facts"}
+    with_kernel.pop("js_symbol_facts", None)
     assert with_kernel == without_kernel
     assert with_kernel["nodes"], "fixture should produce nodes"

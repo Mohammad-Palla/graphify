@@ -54,12 +54,18 @@ def compare(tmp_path, source: str, *, language="typescript", extra: dict | None 
     path = tmp_path / f"subject{SUFFIX[language]}"
     path.write_text(source)
     got, reason = gk.extract_file(
-        str(path), path.read_bytes(), language, kseam._import_resolver(str(path))
+        str(path), path.read_bytes(), language,
+        kseam._import_resolver(str(path)), kseam._module_resolver(str(path)),
     )
     if got is not None:
         want = _extract_generic(path, CONFIG[language])
-        assert _canon(got) == _canon(want), (
-            f"DIVERGENT\n native: {_canon(got)}\n python: {_canon(want)}"
+        # `js_symbol_facts` is the kernel's extra side-channel for phase 3 and has
+        # no `_extract_generic` counterpart; `tests/test_kernel_facts_parity` and
+        # `harness/kernel_facts_parity.py` gate it against the Python collector.
+        # Everything else must match byte for byte.
+        graph_part = {k: v for k, v in got.items() if k != "js_symbol_facts"}
+        assert _canon(graph_part) == _canon(want), (
+            f"DIVERGENT\n native: {_canon(graph_part)}\n python: {_canon(want)}"
         )
     return got, reason
 
@@ -435,7 +441,8 @@ def test_invalid_utf8_source_defers(tmp_path):
     path = tmp_path / "bad.ts"
     path.write_bytes(b"export function f\xff\xfe() { return 1; }\n")
     got, reason = gk.extract_file(
-        str(path), path.read_bytes(), "typescript", kseam._import_resolver(str(path))
+        str(path), path.read_bytes(), "typescript",
+        kseam._import_resolver(str(path)), kseam._module_resolver(str(path)),
     )
     assert got is None and reason in ("source_not_utf8", "parse_error"), reason
 
@@ -448,7 +455,8 @@ def test_a_pathologically_deep_tree_defers_instead_of_overflowing(tmp_path):
     path = tmp_path / "deep.js"
     path.write_text(source)
     got, reason = gk.extract_file(
-        str(path), path.read_bytes(), "javascript", kseam._import_resolver(str(path))
+        str(path), path.read_bytes(), "javascript",
+        kseam._import_resolver(str(path)), kseam._module_resolver(str(path)),
     )
     assert got is None and reason == "tree_too_deep", reason
 

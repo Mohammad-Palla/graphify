@@ -87,16 +87,21 @@ fn supported_languages() -> Vec<&'static str> {
 /// `resolve_import` is a callable `(specifier) -> tuple | None` wrapping
 /// `_resolve_js_import_target`. Omitting it does not disable imports -- it makes
 /// any file containing one defer, since resolution has no safe default.
+///
+/// `resolve_module` is the same idea for `_resolve_js_module_path`, used only by
+/// the symbol-fact collector. Omitting it drops `js_symbol_facts` from the result
+/// (phase 3 then collects them in Python) but leaves nodes/edges native.
 #[pyfunction]
-#[pyo3(signature = (path, source, language, resolve_import=None))]
+#[pyo3(signature = (path, source, language, resolve_import=None, resolve_module=None))]
 fn extract_file<'py>(
     py: Python<'py>,
     path: &str,
     source: &[u8],
     language: &str,
     resolve_import: Option<Bound<'py, PyAny>>,
+    resolve_module: Option<Bound<'py, PyAny>>,
 ) -> PyResult<(Option<Bound<'py, PyDict>>, Option<&'static str>)> {
-    let res = js::imports::Resolver::new(resolve_import);
+    let res = js::imports::Resolver::new(resolve_import, resolve_module);
     match languages::walker_for(language) {
         None => Ok((None, Some("no_walker"))),
         Some(walker) => match walker(py, path, source, &res)? {

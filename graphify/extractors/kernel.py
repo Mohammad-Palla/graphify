@@ -201,17 +201,47 @@ def language_for(config: Any) -> str | None:
 # time, and `resolution` / `base` sit on the other side of that edge -- binding
 # them eagerly here would close an import cycle.
 _resolve_js_import_target: Callable | None = None
+_resolve_js_module_path: Callable | None = None
 _py_file_stem: Callable | None = None
 
 
 def _bind_resolver_helpers() -> None:
-    global _resolve_js_import_target, _py_file_stem
+    global _resolve_js_import_target, _resolve_js_module_path, _py_file_stem
     if _resolve_js_import_target is not None:
         return
     from graphify.extractors.base import _file_stem
-    from graphify.extractors.resolution import _resolve_js_import_target as _r
+    from graphify.extractors.resolution import (
+        _resolve_js_import_target as _r,
+        _resolve_js_module_path as _m,
+    )
     _resolve_js_import_target = _r
+    _resolve_js_module_path = _m
     _py_file_stem = _file_stem
+
+
+def _module_resolver(str_path: str) -> Callable[[str], str | None]:
+    """A `(specifier) -> resolved-path-string | None` callable for the fact pass.
+
+    Deliberately a SECOND resolver rather than a reuse of `_import_resolver`.
+    `_resolve_js_import_target` and `_resolve_js_module_path` are different
+    functions with different fallbacks -- the first mints a `ref`-namespaced id
+    for a specifier it cannot resolve, the second returns None -- and
+    `_collect_js_facts_one_file` calls the second. Sharing one would silently
+    change which specifiers produce facts.
+
+    `.resolve()` is applied here because the Python collector applies it, and the
+    resolved string is what lands in the fact tuples.
+    """
+    _bind_resolver_helpers()
+    resolve = _resolve_js_module_path
+    assert resolve is not None
+    parent = Path(str_path).parent
+
+    def _resolve(raw: str) -> str | None:
+        target = resolve(raw, parent)
+        return None if target is None else str(target.resolve())
+
+    return _resolve
 
 
 def _import_resolver(str_path: str) -> Callable[[str], tuple | None]:
@@ -248,6 +278,75 @@ def _import_resolver(str_path: str) -> Callable[[str], tuple | None]:
         )
 
     return _resolve
+
+
+def js_facts_from_native(path: Path, payload: Any) -> tuple | None:
+    """Turn the kernel's flat fact tuples into `_SymbolResolutionFacts` objects.
+
+    The dataclasses stay defined in ONE place (`extractors.models`) and are
+    constructed here rather than in Rust: the native side ships plain tuples, so
+    a field added to any fact type is a Python-side change only, and the two
+    implementations cannot drift into different record shapes.
+
+    Called by the PARENT, not the worker, which is what keeps
+    `js_symbol_facts` JSON-serializable while it rides in the extraction result.
+    That matters because the result can still reach `save_cached`: the
+    cache-bypass list is matched on the exact lowercase suffix, so a file named
+    `A.TS` is cached like any other, and a dataclass in the payload made
+    `json.dump` raise `TypeError: Object of type _SymbolResolutionFacts is not
+    JSON serializable`. Tuples round-trip through the cache as lists, which
+    unpack identically here.
+    """
+    from graphify.extractors.models import (
+        _NamespaceExportFact,
+        _StarExportFact,
+        _SymbolAliasFact,
+        _SymbolDeclarationFact,
+        _SymbolExportFact,
+        _SymbolImportFact,
+        _SymbolResolutionFacts,
+        _SymbolUseFact,
+    )
+
+    def build(d: dict):
+        f = _SymbolResolutionFacts()
+        f.declarations.extend(
+            _SymbolDeclarationFact(path, name, line) for name, line in d["declarations"]
+        )
+        f.imports.extend(
+            _SymbolImportFact(path, local, Path(target), imported, line)
+            for local, target, imported, line in d["imports"]
+        )
+        f.aliases.extend(
+            _SymbolAliasFact(path, alias, target, line)
+            for alias, target, line in d["aliases"]
+        )
+        f.exports.extend(
+            _SymbolExportFact(
+                path, exported, line, local,
+                None if target is None else Path(target), target_name,
+            )
+            for exported, line, local, target, target_name in d["exports"]
+        )
+        f.star_exports.extend(
+            _StarExportFact(path, Path(target), line) for target, line in d["star_exports"]
+        )
+        f.namespace_exports.extend(
+            _NamespaceExportFact(path, exported, Path(target), line)
+            for exported, target, line in d["namespace_exports"]
+        )
+        f.uses.extend(
+            _SymbolUseFact(path, source_id, local, relation, context, line)
+            for source_id, local, relation, context, line in d["uses"]
+        )
+        return f
+
+    try:
+        return build(payload[0]), build(payload[1])
+    except Exception:
+        # A shape the converter does not understand must cost a deferral, not a
+        # half-built fact set: phase 3 re-collects this file in Python.
+        return None
 
 
 def try_extract(path: Path, config: Any,
@@ -289,7 +388,8 @@ def try_extract(path: Path, config: Any,
     str_path = str(path)
     try:
         result, reason = mod.extract_file(
-            str_path, source, language, _import_resolver(str_path)
+            str_path, source, language,
+            _import_resolver(str_path), _module_resolver(str_path),
         )
     except BaseException as exc:
         # BaseException, not Exception, and deliberately so.
@@ -319,6 +419,8 @@ def try_extract(path: Path, config: Any,
         # then has to be guessed.
         _counts[f"defer:{language}:{reason or 'unknown'}"] += 1
         return None
+    if "js_symbol_facts" in result:
+        _counts[f"native_facts:{language}"] += 1
     _counts[f"native:{language}"] += 1
     return result
 

@@ -55,14 +55,45 @@ pub struct Resolution {
 pub struct Resolver<'py> {
     callback: Option<Bound<'py, PyAny>>,
     cache: RefCell<HashMap<String, Option<Resolution>>>,
+    /// `_resolve_js_module_path(raw, file.parent)` then `.resolve()`, as a string.
+    ///
+    /// A SECOND resolver, not a reuse of the first: `_resolve_js_import_target`
+    /// and `_resolve_js_module_path` are different functions with different
+    /// fallbacks -- the former mints a `ref`-namespaced id for an unresolvable
+    /// specifier, the latter simply returns None -- and the symbol-fact collector
+    /// calls the latter. Sharing one would silently change which specifiers
+    /// produce facts.
+    module_callback: Option<Bound<'py, PyAny>>,
+    module_cache: RefCell<HashMap<String, Option<String>>>,
 }
 
 impl<'py> Resolver<'py> {
-    pub fn new(callback: Option<Bound<'py, PyAny>>) -> Self {
+    pub fn new(
+        callback: Option<Bound<'py, PyAny>>,
+        module_callback: Option<Bound<'py, PyAny>>,
+    ) -> Self {
         Resolver {
             callback,
             cache: RefCell::new(HashMap::new()),
+            module_callback,
+            module_cache: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// `_resolve_js_module_path(raw, dir).resolve()` as a string, memoized per
+    /// file. `Err` when no resolver was supplied: the facts must defer rather
+    /// than silently drop every import fact in the file.
+    pub fn resolve_module(&self, raw: &str) -> R<Option<String>> {
+        if let Some(v) = self.module_cache.borrow().get(raw) {
+            return Ok(v.clone());
+        }
+        let cb = self.module_callback.as_ref().ok_or("no_module_resolver")?;
+        let ret = cb.call1((raw,)).map_err(|_| "module_resolver_raised")?;
+        let parsed: Option<String> = ret.extract().map_err(|_| "module_resolver_bad_shape")?;
+        self.module_cache
+            .borrow_mut()
+            .insert(raw.to_string(), parsed.clone());
+        Ok(parsed)
     }
 
     fn get(&self, raw: &str) -> R<Option<Resolution>> {

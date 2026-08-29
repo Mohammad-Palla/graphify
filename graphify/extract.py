@@ -6220,9 +6220,26 @@ def extract(
     # Forward the caller's pool controls: extract(parallel=False) is documented
     # as the way to skip process pools entirely (see _extract_parallel's own
     # BrokenProcessPool message), so it must bind the symbol-resolution pool too.
+    # Symbol-resolution facts the extraction pass already produced, keyed by path.
+    # `per_file` is index-aligned with `paths`, so this is the whole handoff.
+    #
+    # Without it phase 3's collector re-parses every JS/TS file to rebuild these,
+    # which made a full build call tree-sitter's `parse()` 2.07 times per
+    # JS/TS-family file. Parse is C on both sides and is the one cost a native
+    # walker cannot reduce, so paying it twice was the largest avoidable item in
+    # the pipeline. Files the walker deferred are simply absent from the map and
+    # are collected in Python as before.
+    _js_facts: dict[Path, tuple] = {}
+    for _i, _result in enumerate(per_file):
+        if not _result or "js_symbol_facts" not in _result:
+            continue
+        _built = _kernel_seam.js_facts_from_native(paths[_i], _result["js_symbol_facts"])
+        if _built is not None:
+            _js_facts[paths[_i]] = _built
     _augment_symbol_resolution_edges(
         paths, all_nodes, all_edges, root,
         parallel=parallel, max_workers=max_workers,
+        precomputed_js_facts=_js_facts,
     )
     _p3.mark("augment_symbol_res")
 
