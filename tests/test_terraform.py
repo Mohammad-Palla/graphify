@@ -3,8 +3,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from graphify.build import build_from_json
 from graphify.extract import extract_terraform
+
+# Terraform support is an OPTIONAL extra (`pip install "graphifyy[terraform]"`),
+# and without the grammar `extract_terraform` returns an error result rather than
+# raising. Asserting on that result is not a test of this extractor, it is a test
+# of whether the grammar happens to be installed -- and it left seven permanent
+# red entries in the suite, which is how a baseline failure count becomes a number
+# to memorise instead of a signal. Skip instead, so the suite is green when the
+# extra is absent and these run for real when it is present.
+pytest.importorskip("tree_sitter_hcl",
+                    reason='needs the terraform extra: pip install "graphifyy[terraform]"')
 
 
 def _write(tmp_path: Path, name: str, body: str) -> Path:

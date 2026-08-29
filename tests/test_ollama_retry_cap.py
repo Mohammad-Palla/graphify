@@ -7,7 +7,15 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 import graphify.llm as llm
+
+# The `openai` SDK is an optional dependency: `_capture_client_kwargs`
+# monkeypatches `openai.OpenAI`, which cannot be imported to be patched when the
+# package is absent. The retry-cap behaviour under test is real and worth testing
+# -- it just needs the backend installed.
+pytest.importorskip("openai", reason="needs the openai SDK (optional LLM backend)")
 
 
 def _capture_client_kwargs(monkeypatch):
