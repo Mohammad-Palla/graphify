@@ -60,6 +60,8 @@ pub type Walker = for<'py> fn(
 /// symfony  php          11306   99.8%      0.2%          0
 /// laravel  php           3052  100.0%      0.0%          0
 /// guzzle   php            137  100.0%      0.0%          0
+/// bats     bash           281   96.8%      3.2%          0
+/// (6 more) bash           134   72.4%     27.6%          0
 /// redis    c              756   56.2%     43.8%          0
 /// curl     c             1014   73.7%     26.3%          0
 /// ```
@@ -82,6 +84,16 @@ pub type Walker = for<'py> fn(
 /// PHP is the opposite extreme and the best result of any language ported here
 /// after JS/TS and Python: 99.8% over 14,495 files. There is no preprocessor and
 /// no contextual-keyword trap, so essentially every file parses.
+///
+/// Bash is the first BESPOKE walker ported (see `bash/`), and its deferrals are
+/// a deliberate scope choice rather than a parser limit: a `source` command or a
+/// `.sh` script invocation resolves through the filesystem -- `Path.resolve()`,
+/// `is_file()`, a `var_bases` table and a traversal guard against an
+/// attacker-controllable corpus -- so a file containing either defers whole.
+/// Measured across every corpus, 10% of shell files contain a `source` -- but
+/// they are not spread evenly, and the per-corpus native rate runs from 96.8%
+/// (bats) down to 34.5% (efcore, whose shell scripts are almost all
+/// source-and-dispatch wrappers). 368 of 415 files over seven corpora.
 ///
 /// C#'s deferral rate is an order of magnitude above every other language's and
 /// it is NOT a gap in the walker: 8.2% of those 7,177 files make
@@ -112,7 +124,7 @@ pub type Walker = for<'py> fn(
 pub fn supported() -> Vec<&'static str> {
     vec![
         "typescript", "tsx", "javascript", "python", "java", "csharp", "c", "cpp",
-        "php",
+        "php", "bash",
     ]
 }
 
@@ -127,6 +139,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
         "c" => Some(crate::c::walk_c),
         "cpp" => Some(crate::cpp::walk_cpp),
         "php" => Some(crate::php::walk_php),
+        "bash" => Some(crate::bash::walk_bash),
         _ => None,
     }
 }
@@ -152,7 +165,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
 /// The node-kind and field counts change with essentially any grammar revision,
 /// which is what makes the triple a usable proxy for "same grammar".
 pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
-    let langs: [(&'static str, tree_sitter::Language); 9] = [
+    let langs: [(&'static str, tree_sitter::Language); 10] = [
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ("javascript", tree_sitter_javascript::LANGUAGE.into()),
@@ -162,6 +175,7 @@ pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
         ("c", tree_sitter_c::LANGUAGE.into()),
         ("cpp", tree_sitter_cpp::LANGUAGE.into()),
         ("php", tree_sitter_php::LANGUAGE_PHP.into()),
+        ("bash", tree_sitter_bash::LANGUAGE.into()),
     ];
     langs
         .iter()

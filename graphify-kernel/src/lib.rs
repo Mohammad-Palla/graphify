@@ -31,6 +31,7 @@ use pyo3::types::{PyDict, PyList};
 
 mod engine;
 mod ids;
+mod bash;
 mod c;
 mod cpp;
 mod csharp;

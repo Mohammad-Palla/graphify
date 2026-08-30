@@ -61,6 +61,7 @@ _GRAMMAR_TO_LANGUAGE: dict[tuple[str, str], str] = {
     ("tree_sitter_c", "language"): "c",
     ("tree_sitter_cpp", "language"): "cpp",
     ("tree_sitter_php", "language_php"): "php",
+    ("tree_sitter_bash", "language"): "bash",
 }
 
 # The reverse map, for the grammar-version check below: kernel language key ->
@@ -185,6 +186,26 @@ def enabled_languages() -> set[str]:
     if mod is None:
         return set()
     return getattr(mod, "_graphify_supported", set())
+
+
+class BespokeGrammar:
+    """A stand-in `LanguageConfig` for an extractor that has none.
+
+    `extract_bash`, `extract_go` and `extract_rust` are hand-written walkers, not
+    `_extract_generic` under a config -- so they have no `ts_module` /
+    `ts_language_fn` for `language_for` to route on, and without this they could
+    never reach the kernel at all.
+
+    Two attributes, and deliberately not a `LanguageConfig`: the routing key stays
+    ONE table keyed on the grammar pair, and nothing here can be mistaken for a
+    config the engine could be driven by.
+    """
+
+    __slots__ = ("ts_module", "ts_language_fn")
+
+    def __init__(self, ts_module: str, ts_language_fn: str = "language") -> None:
+        self.ts_module = ts_module
+        self.ts_language_fn = ts_language_fn
 
 
 def language_for(config: Any) -> str | None:

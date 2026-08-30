@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from graphify.extractors import kernel as _kernel
 from graphify.extractors.base import _file_stem, _make_id, _read_text
 
 
@@ -102,8 +103,19 @@ def _bash_assignment_base(value: str, script_dir: Path) -> Path | None:
     return candidate if candidate.is_absolute() else script_dir / candidate
 
 
+# Routing key for the native walker. `extract_bash` is a bespoke walk, not
+# `_extract_generic` under a config, so it carries its own grammar pair.
+_KERNEL_GRAMMAR = _kernel.BespokeGrammar("tree_sitter_bash")
+
+
 def extract_bash(path: Path) -> dict:
     """Extract functions, source imports, and cross-function calls from a .sh file."""
+    # Native kernel first, above the grammar import: a routed file must not pay
+    # for loading the Python grammar it will not use. Returns None for "not
+    # mine -- carry on", and never raises.
+    native = _kernel.try_extract(path, _KERNEL_GRAMMAR)
+    if native is not None:
+        return native
     try:
         import tree_sitter_bash as tsbash
         from tree_sitter import Language, Parser
