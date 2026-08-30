@@ -15,12 +15,12 @@
 //! None) -- the Python calls it from `walk` behind an `_is_java` guard. Here it
 //! is the `extra_walk` hook, which is the same position.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use pyo3::prelude::*;
 use tree_sitter::Node;
 
-use crate::engine::{CallInfo, Ctx, EngineConfig, Handled, LangHooks, R};
+use crate::engine::{CallInfo, Ctx, EngineConfig, Handled, LangHooks, RecvTable, R};
 use crate::js::ast::children;
 use crate::js::emit::Val;
 use crate::Outcome;
@@ -332,7 +332,12 @@ impl LangHooks for Java {
         Ok(Handled::Yes)
     }
 
-    fn call_info<'tree>(&self, ctx: &Ctx<'_, 'tree>, node: Node<'tree>) -> R<Option<CallInfo>> {
+    fn call_info<'tree>(
+        &self,
+        ctx: &mut Ctx<'_, 'tree>,
+        node: Node<'tree>,
+        _caller_nid: &str,
+    ) -> R<Option<CallInfo>> {
         let mut info = CallInfo::default();
         if node.kind() == "object_creation_expression" {
             // #1373: the constructed type is the `type` field, not `name`.
@@ -379,16 +384,20 @@ impl LangHooks for Java {
     fn raw_call_extra<'tree>(
         &self,
         _ctx: &Ctx<'_, 'tree>,
+        node: Node<'tree>,
         info: &CallInfo,
-        receiver_types: &HashMap<String, String>,
+        receiver_types: &RecvTable,
     ) -> Vec<(&'static str, Val)> {
         let mut out: Vec<(&'static str, Val)> = vec![("lang", Val::Static("java"))];
+        // `(receiver_types or {}).get(member_receiver or "")` -- a flat lookup.
+        // The offset is passed because the accessor takes one; `RecvTable::Flat`
+        // ignores it.
         if let Some(rt) = info
             .member_receiver
             .as_deref()
-            .and_then(|r| receiver_types.get(r))
+            .and_then(|r| receiver_types.type_of(r, node.start_byte()))
         {
-            out.push(("receiver_type", Val::S(rt.clone())));
+            out.push(("receiver_type", Val::S(rt.to_string())));
         }
         out
     }
@@ -419,6 +428,7 @@ pub static CONFIG: EngineConfig = EngineConfig {
     call_accessor_field: "attribute",
     call_accessor_object_field: "",
     function_label_parens: true,
+    resolve_function_name: None,
     hooks: &HOOKS,
 };
 
@@ -428,5 +438,5 @@ pub fn walk_java<'py>(
     source: &[u8],
     _res: &crate::Resolvers<'py>,
 ) -> PyResult<Outcome<'py>> {
-    crate::engine::run(py, &CONFIG, path, source, calls::method_receiver_types)
+    crate::engine::run(py, &CONFIG, path, source, calls::method_receiver_types, None)
 }

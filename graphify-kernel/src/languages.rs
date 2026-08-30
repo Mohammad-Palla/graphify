@@ -49,7 +49,38 @@ pub type Walker = for<'py> fn(
 /// guava    java          3275   99.6%      0.4%          0
 /// gson     java           264  100.0%      0.0%          0
 /// java     java            50  100.0%      0.0%          0
+/// serilog  csharp         216   91.7%      8.3%          0
+/// newtonsoft csharp       945   93.1%      6.9%          0
+/// eShopOnWeb csharp       254  100.0%      0.0%          0
+/// efcore   csharp        5762   91.2%      8.8%          0
+/// libuv    c              367   80.7%     19.3%          0
+/// redis    c              756   56.2%     43.8%          0
+/// curl     c             1014   73.7%     26.3%          0
 /// ```
+///
+/// C's native rate is the lowest of any language here and, like C#'s, it is a
+/// parser limit rather than a walker gap -- but a much harder one. 31.8% of
+/// those 2,137 files make `tree-sitter-c` produce an ERROR node, because
+/// tree-sitter has no preprocessor and a function-like macro in DECLARATION
+/// position derails the parse: `UNUSED static int f(void)`,
+/// `HEAP_EXPORT(void heap_init(struct heap*))`, `TEST_IMPL(foo)`, `WINAPI`. That
+/// is inherent to parsing C without expanding macros, and it caps what any
+/// native C walker can reach at roughly two thirds of a real codebase.
+///
+/// C#'s deferral rate is an order of magnitude above every other language's and
+/// it is NOT a gap in the walker: 8.2% of those 7,177 files make
+/// `tree-sitter-c-sharp` 0.23.5 produce an ERROR node, and Python's recovery is
+/// authoritative, so the file defers. The dominant cause, measured rather than
+/// assumed, is `async` used as an ordinary identifier in EXPRESSION position --
+/// `await base.M(async)`, `M(async, x)`, `async ? a : b`, `var x = async` --
+/// where the grammar commits to an async-lambda parse. In DECLARATION position
+/// (`Task Foo(bool async)`) it parses fine, so it is the call and not the
+/// signature that breaks. That is 43% of the erroring files on its own,
+/// concentrated in EF Core's parameterized test suites, which take `bool async`
+/// and forward it. Conditional
+/// compilation (`#if` around an enum member or a collection initializer) is only
+/// 13%; it is worth naming because it is the cause CodeGraph documents for its
+/// own C# grammar trouble, and it is not the cause here.
 ///
 /// The residual deferrals are, in order: a parse error (Python's recovery is
 /// authoritative), a decorator (mints stub nodes through `ensure_named_node`), a
@@ -63,7 +94,7 @@ pub type Walker = for<'py> fn(
 /// walrus operators, `match`, heavy `typing` generics and `getattr` dispatch that
 /// django's 2,929 files barely use.
 pub fn supported() -> Vec<&'static str> {
-    vec!["typescript", "tsx", "javascript", "python", "java"]
+    vec!["typescript", "tsx", "javascript", "python", "java", "csharp", "c"]
 }
 
 pub fn walker_for(language: &str) -> Option<Walker> {
@@ -73,6 +104,8 @@ pub fn walker_for(language: &str) -> Option<Walker> {
         "javascript" => Some(crate::js::walk_javascript),
         "python" => Some(crate::py::walk_python),
         "java" => Some(crate::java::walk_java),
+        "csharp" => Some(crate::csharp::walk_csharp),
+        "c" => Some(crate::c::walk_c),
         _ => None,
     }
 }
@@ -98,15 +131,14 @@ pub fn walker_for(language: &str) -> Option<Walker> {
 /// The node-kind and field counts change with essentially any grammar revision,
 /// which is what makes the triple a usable proxy for "same grammar".
 pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
-    let langs: [(&'static str, tree_sitter::Language); 5] = [
+    let langs: [(&'static str, tree_sitter::Language); 7] = [
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ("javascript", tree_sitter_javascript::LANGUAGE.into()),
-        // Fingerprinted before it is `supported()`, so the version agreement is
-        // proven by the same mechanism from the walker's first parity run rather
-        // than being switched on with it.
         ("python", tree_sitter_python::LANGUAGE.into()),
         ("java", tree_sitter_java::LANGUAGE.into()),
+        ("csharp", tree_sitter_c_sharp::LANGUAGE.into()),
+        ("c", tree_sitter_c::LANGUAGE.into()),
     ];
     langs
         .iter()

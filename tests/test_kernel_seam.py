@@ -57,14 +57,16 @@ def _fake_kernel(*, languages=(), tree_sitter_ok=True, extract=None, version="0.
                             "tree_sitter_ok": tree_sitter_ok,
                             "grammars": dict(grammars)}
     # The real signature: `(result, defer_reason)`, exactly one of them non-None,
-    # plus the three resolver callbacks the walkers call back into (JS import, JS
-    # module, Python relative import). Pinned rather than `*args`: a stub that
-    # swallowed any arity would let the seam and the kernel drift apart silently,
-    # and the seam converts every TypeError into a deferral -- so the drift would
-    # show up as a quietly falling native rate, not a failure.
-    # `test_seam_calls_the_real_signature` asserts this matches the real module.
+    # plus the resolver callbacks the walkers call back into (JS import, JS
+    # module, Python relative import, C include). Pinned rather than `*args`: a
+    # stub that swallowed any arity would let the seam and the kernel drift apart
+    # silently, and the seam converts every TypeError into a deferral -- so the
+    # drift would show up as a quietly falling native rate, not a failure.
+    # `test_seam_passes_every_resolver_the_kernel_takes` checks that against the
+    # real module rather than against this list.
     mod.extract_file = (extract if extract is not None
-                        else (lambda p, s, l, r=None, m=None, pr=None: (None, "fake")))
+                        else (lambda p, s, l, r=None, m=None, pr=None, ci=None:
+                              (None, "fake")))
     return mod
 
 
@@ -165,7 +167,7 @@ def test_walker_exception_is_a_deferral_not_a_build_failure(monkeypatch, tmp_pat
     monkeypatch.delenv("GRAPHIFY_KERNEL", raising=False)
 
     def _explode(path, source, language, resolve_import=None, resolve_module=None,
-                resolve_py_import=None):
+                resolve_py_import=None, resolve_c_include=None):
         raise ValueError("walker bug")
 
     _install(monkeypatch, _fake_kernel(languages=("typescript",), extract=_explode))
@@ -180,7 +182,7 @@ def test_native_result_is_returned_and_counted(monkeypatch, tmp_path):
     payload = {"nodes": [{"id": "n"}], "edges": []}
     _install(monkeypatch, _fake_kernel(
         languages=("typescript",),
-        extract=lambda p, s, l, r=None, m=None, pr=None: (payload, None)))
+        extract=lambda p, s, l, r=None, m=None, pr=None, ci=None: (payload, None)))
     f = tmp_path / "a.ts"
     f.write_bytes(b"const x = 1;")
     assert kernel.try_extract(f, _Cfg()) is payload
@@ -193,7 +195,7 @@ def test_source_override_is_honoured(monkeypatch, tmp_path):
     seen: dict = {}
 
     def _capture(path, source, language, resolve_import=None, resolve_module=None,
-                 resolve_py_import=None):
+                 resolve_py_import=None, resolve_c_include=None):
         seen["source"] = source
         return ({"nodes": [], "edges": []}, None)
 
@@ -222,7 +224,7 @@ def test_real_rust_panic_is_a_deferral(monkeypatch, tmp_path):
     monkeypatch.delenv("GRAPHIFY_KERNEL", raising=False)
 
     def _panic(path, source, language, resolve_import=None, resolve_module=None,
-               resolve_py_import=None):
+               resolve_py_import=None, resolve_c_include=None):
         real.debug_panic()
 
     _install(monkeypatch, _fake_kernel(languages=("typescript",), extract=_panic))
@@ -239,7 +241,7 @@ def test_interrupts_are_not_swallowed(monkeypatch, tmp_path, exc):
     monkeypatch.delenv("GRAPHIFY_KERNEL", raising=False)
 
     def _interrupt(path, source, language, resolve_import=None, resolve_module=None,
-                  resolve_py_import=None):
+                  resolve_py_import=None, resolve_c_include=None):
         raise exc()
 
     _install(monkeypatch, _fake_kernel(languages=("typescript",), extract=_interrupt))
@@ -255,7 +257,7 @@ def test_deferral_is_counted_by_reason(monkeypatch, tmp_path):
     monkeypatch.delenv("GRAPHIFY_KERNEL", raising=False)
     _install(monkeypatch, _fake_kernel(
         languages=("typescript",),
-        extract=lambda p, s, l, r=None, m=None, pr=None: (None, "decorator")))
+        extract=lambda p, s, l, r=None, m=None, pr=None, ci=None: (None, "decorator")))
     f = tmp_path / "a.ts"
     f.write_bytes(b"const x = 1;")
     assert kernel.try_extract(f, _Cfg()) is None
@@ -276,7 +278,7 @@ def test_grammar_mismatch_drops_the_language(monkeypatch, tmp_path):
     called: list = []
 
     def _extract(path, source, language, resolve_import=None, resolve_module=None,
-                 resolve_py_import=None):
+                 resolve_py_import=None, resolve_c_include=None):
         called.append(path)
         return ({"nodes": [], "edges": []}, None)
 
@@ -341,11 +343,84 @@ def test_one_language_config_per_routed_grammar():
                 f"{names[0]}.{field} is now non-empty; the native walker omits "
                 f"that branch entirely (see src/js/walk.rs) and would drop its edges"
             )
-        assert cfg.name_fallback_child_types == (), names[0]
-        assert cfg.body_fallback_child_types == (), names[0]
-        assert cfg.resolve_function_name_fn is None, names[0]
+        # These two are only meaningful for a HAND-WRITTEN walker (js/, py/),
+        # which ignores them: it hard-codes the sets it was written against, so
+        # a non-empty tuple here would be silently dropped. An engine-driven
+        # language reads them from `EngineConfig` at run time and is checked
+        # field for field by the test below instead.
+        if _GRAMMAR_TO_LANGUAGE[key] not in _engine_languages():
+            assert cfg.name_fallback_child_types == (), names[0]
+            assert cfg.body_fallback_child_types == (), names[0]
+            assert cfg.resolve_function_name_fn is None, names[0]
         assert cfg.sanitize_symbol_name_fn is None, names[0]
         assert dataclasses.is_dataclass(cfg)
+
+
+def _engine_languages() -> set[str]:
+    """Languages driven by the shared Rust engine, or empty if it is not built."""
+    try:
+        import graphify_kernel
+    except ImportError:
+        return set()
+    if not hasattr(graphify_kernel, "engine_configs"):
+        return set()
+    return set(graphify_kernel.engine_configs())
+
+
+def test_engine_configs_match_their_language_config():
+    """Every dispatch field an engine-driven walker reads must equal the Python's.
+
+    Routing on `(ts_module, ts_language_fn)` proves the two sides load the same
+    GRAMMAR. It says nothing about whether they dispatch on the same NODE KINDS
+    -- and the engine reads all of them from its own `EngineConfig`, a hand-typed
+    copy of the `LanguageConfig`. A typo there (a missing `record_declaration`,
+    an `attribute` where the Python says `name`) silently changes what becomes a
+    node, on exactly the constructs a corpus may not contain.
+
+    This is the check that scales: it gets stronger with each language added to
+    the engine rather than needing a new exemption.
+    """
+    kernel_mod = pytest.importorskip("graphify_kernel",
+                                     reason="native kernel not built")
+    if not hasattr(kernel_mod, "engine_configs"):
+        pytest.skip("kernel predates engine_configs()")
+
+    from graphify import extract as extract_module
+    from graphify.extractors.kernel import _LANGUAGE_TO_GRAMMAR, _GRAMMAR_TO_LANGUAGE
+    from graphify.extractors.models import LanguageConfig
+
+    by_grammar = {}
+    for name in dir(extract_module):
+        cfg = getattr(extract_module, name)
+        if isinstance(cfg, LanguageConfig):
+            by_grammar[(cfg.ts_module, cfg.ts_language_fn)] = (name, cfg)
+
+    SET_FIELDS = ("class_types", "function_types", "import_types", "call_types",
+                  "function_boundary_types", "call_accessor_node_types")
+    TUPLE_FIELDS = ("name_fallback_child_types", "body_fallback_child_types")
+    SCALAR_FIELDS = ("name_field", "body_field", "call_function_field",
+                     "call_accessor_field", "call_accessor_object_field",
+                     "function_label_parens")
+    # Not a value comparison: the engine reports whether it has a resolver, and
+    # the two must AGREE about that, because `None` selects a different branch of
+    # the function-name lookup rather than meaning "do nothing".
+    PRESENCE_FIELDS = ("resolve_function_name",)
+
+    engine = kernel_mod.engine_configs()
+    assert engine, "the engine reported no languages"
+    for language, native in engine.items():
+        grammar = _LANGUAGE_TO_GRAMMAR[language]
+        name, cfg = by_grammar[grammar]
+        for field in SET_FIELDS:
+            assert set(native[field]) == set(getattr(cfg, field)), f"{name}.{field}"
+        for field in TUPLE_FIELDS:
+            assert tuple(native[field]) == tuple(getattr(cfg, field)), f"{name}.{field}"
+        for field in SCALAR_FIELDS:
+            assert native[field] == getattr(cfg, field), f"{name}.{field}"
+        for field in PRESENCE_FIELDS:
+            assert native[field] == (getattr(cfg, f"{field}_fn") is not None), \
+                f"{name}.{field}_fn"
+        assert _GRAMMAR_TO_LANGUAGE[grammar] == language
 
 
 # ── the invariant that matters most ──────────────────────────────────────────
@@ -408,7 +483,45 @@ def test_seam_calls_the_real_signature():
         seam._import_resolver("/tmp/probe.ts"),
         seam._module_resolver("/tmp/probe.ts"),
         seam._py_import_resolver("/tmp/probe.ts"),
+        seam._c_include_resolver("/tmp/probe.ts"),
     )
     assert (result is None) != (reason is None), (
         "extract_file must return exactly one of (result, reason)"
+    )
+
+
+def test_seam_passes_every_resolver_the_kernel_takes(tmp_path, monkeypatch):
+    """The seam must fill EVERY resolver slot the kernel declares.
+
+    Each resolver defaults to None on the Rust side, and a walker that finds its
+    resolver missing defers -- correctly, but silently. So forgetting to pass a
+    newly added one does not raise, does not fail a parity run (the harness
+    passes its own), and shows up only as a native rate that is quietly lower
+    than it should be. Adding the C include resolver as a fourth parameter is
+    exactly that shape of change, which is why this is checked against the real
+    signature instead of a hand-maintained list.
+    """
+    import inspect
+
+    kernel_mod = pytest.importorskip("graphify_kernel",
+                                     reason="native kernel not built")
+    from graphify.extractors import kernel as seam
+
+    expected = len(inspect.signature(kernel_mod.extract_file).parameters)
+    seen: list[int] = []
+
+    def _record(*args, **kwargs):
+        seen.append(len(args) + len(kwargs))
+        return (None, "recorded")
+
+    monkeypatch.setattr(seam, "_kernel", kernel_mod, raising=False)
+    monkeypatch.setattr(kernel_mod, "extract_file", _record, raising=False)
+    src = tmp_path / "probe.ts"
+    src.write_text("const x = 1;\n")
+    seam.try_extract(src, _Cfg())
+
+    assert seen, "the seam did not call extract_file at all"
+    assert seen[0] == expected, (
+        f"the seam passes {seen[0]} arguments but extract_file declares "
+        f"{expected}; a resolver slot is being left to its None default"
     )

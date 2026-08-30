@@ -51,6 +51,7 @@ use crate::js::ast::text_checked;
 use crate::js::emit::{EdgeRow, NodeRow, RawCall, Val};
 
 pub mod calls;
+pub mod meta;
 pub mod walk;
 
 pub type R<T> = Result<T, &'static str>;
@@ -104,7 +105,26 @@ pub struct EngineConfig {
     /// `function_label_parens`: when false a function's label is bare.
     pub function_label_parens: bool,
 
+    /// `resolve_function_name_fn`. C and C++ name a function by unwrapping its
+    /// `declarator` rather than reading a `name` field, and the Python branches
+    /// on `is not None` -- so this is `Option` for the same reason, not a hook
+    /// with a no-op default: `None` selects a DIFFERENT branch, it does not mean
+    /// "do nothing".
+    pub resolve_function_name: Option<fn(&Ctx, Node) -> R<Option<String>>>,
+
     pub hooks: &'static (dyn LangHooks + Sync),
+}
+
+/// The one filesystem question a walker is allowed to ask, and it asks Python.
+///
+/// `#include "foo.h"` resolves through `Path.resolve()` -- symlinks, `..`
+/// normalization, a non-existent tail -- and reproducing that in Rust is exactly
+/// the kind of surface whose failures are silent. So the walker does the string
+/// work and Graphify's own `_resolve_c_include_path` answers, the same seam
+/// `js::imports::Resolver` and `py::imports::Resolver` already use.
+pub trait PathResolver {
+    /// `(raw) -> resolved absolute path`, or None when it is not a real file.
+    fn resolve(&self, raw: &str) -> R<Option<String>>;
 }
 
 /// Whether a hook consumed the node. `Handled::Yes` means the Python returned.
@@ -200,7 +220,17 @@ pub trait LangHooks {
     /// "use the generic accessor path" (`call_function_field` +
     /// `call_accessor_node_types`), which is what a language with no call guard
     /// does.
-    fn call_info<'tree>(&self, _ctx: &Ctx<'_, 'tree>, _node: Node<'tree>) -> R<Option<CallInfo>> {
+    ///
+    /// Takes `&mut Ctx` and the caller because the branch it stands for is not
+    /// purely an extraction in every language: C#'s `invocation_expression` arm
+    /// also emits a `references[generic_arg]` edge per call-site type argument
+    /// (#2911), from the caller, before the defer decision below.
+    fn call_info<'tree>(
+        &self,
+        _ctx: &mut Ctx<'_, 'tree>,
+        _node: Node<'tree>,
+        _caller_nid: &str,
+    ) -> R<Option<CallInfo>> {
         Ok(None)
     }
 
@@ -210,14 +240,100 @@ pub trait LangHooks {
         false
     }
 
+    /// A last look at the resolved target, AFTER the `label_to_nid` lookup.
+    ///
+    /// One language reaches this: a C# `new A.B.Foo()` whose bare name matches
+    /// only a sourceless stub in this file would bind to the stub and never
+    /// reach `_resolve_csharp_qualified_calls`, the one pass that can honour the
+    /// namespace. It is a separate slot from `defers` because it needs the
+    /// looked-up id, which `defers` by definition does not have.
+    fn refine_target(&self, _ctx: &Ctx, _info: &CallInfo, tgt: Option<String>) -> Option<String> {
+        tgt
+    }
+
     /// Extra keys appended to a `raw_call`, in Python's order, after `receiver`.
+    ///
+    /// `node` is the CALL node: C# resolves a receiver's type by the call's byte
+    /// offset, so the position is part of the lookup, not just the name.
     fn raw_call_extra<'tree>(
         &self,
         _ctx: &Ctx<'_, 'tree>,
+        _node: Node<'tree>,
         _info: &CallInfo,
-        _receiver_types: &HashMap<String, String>,
+        _receiver_types: &RecvTable,
     ) -> Vec<(&'static str, Val)> {
         Vec::new()
+    }
+
+    /// A per-file name pre-scan, run over the whole tree BEFORE the walk.
+    ///
+    /// C# is the one caller: `_csharp_pre_scan_interfaces` collects the file's
+    /// `interface_declaration` names so `on_class` can classify a base type as
+    /// `implements` rather than `inherits` without a second pass. Languages with
+    /// no pre-scan leave the set empty. (Swift's `_swift_pre_scan` returns TWO
+    /// sets; when Swift lands, this widens rather than a second slot appearing.)
+    fn prescan<'tree>(&self, _ctx: &Ctx<'_, 'tree>, _root: Node<'tree>) -> R<HashSet<String>> {
+        Ok(HashSet::new())
+    }
+}
+
+/// The per-method receiver table: `name -> declared type`, for the two languages
+/// that build one.
+///
+/// The two shapes are not interchangeable and the difference is load-bearing.
+/// Java's is a flat map built once per method. C#'s is POSITIONAL (#2472): a
+/// name can be bound several times in one method -- a parameter, a `var` local
+/// in an inner block, a pattern binding in one arm of an `if` -- and the binding
+/// that applies is the innermost one whose lexical range contains the call.
+///
+/// They are one enum with one accessor rather than two types so that neither
+/// hook can reach for the wrong lookup: `type_of` takes the call offset in both
+/// cases and `Flat` simply ignores it.
+pub enum RecvTable {
+    Flat(HashMap<String, String>),
+    Scoped {
+        /// name -> [(scope_start_byte, scope_end_byte, type_or_untypable)]
+        bindings: HashMap<String, Vec<(usize, usize, Option<String>)>>,
+        /// The class field/property base scope, consulted when no lexical
+        /// binding covers the call.
+        base: HashMap<String, String>,
+    },
+}
+
+impl Default for RecvTable {
+    fn default() -> Self {
+        RecvTable::Flat(HashMap::new())
+    }
+}
+
+impl RecvTable {
+    /// The type of `name` as seen from `call_byte`, or None for "no edge".
+    ///
+    /// `Scoped` is `_csharp_scoped_receiver_type`: candidates are the bindings
+    /// whose range contains the offset, the smallest range wins, and a TIE at
+    /// the innermost range (an illegal same-declaration-space clash, or two
+    /// sibling pattern bindings) yields None -- never a guess. No candidate at
+    /// all falls back to the class fields.
+    pub fn type_of(&self, name: &str, call_byte: usize) -> Option<&str> {
+        match self {
+            RecvTable::Flat(m) => m.get(name).map(String::as_str),
+            RecvTable::Scoped { bindings, base } => {
+                let candidates: Vec<&(usize, usize, Option<String>)> = bindings
+                    .get(name)
+                    .map(|v| v.iter().filter(|b| b.0 <= call_byte && call_byte < b.1).collect())
+                    .unwrap_or_default();
+                if candidates.is_empty() {
+                    return base.get(name).map(String::as_str);
+                }
+                let innermost = candidates.iter().map(|b| b.1 - b.0).min()?;
+                let mut inner = candidates.iter().filter(|b| b.1 - b.0 == innermost);
+                let first = inner.next()?;
+                if inner.next().is_some() {
+                    return None;
+                }
+                first.2.as_deref()
+            }
+        }
     }
 }
 
@@ -248,6 +364,25 @@ pub struct Ctx<'a, 'tree> {
     pub label_to_nid: HashMap<String, String>,
     pub nid_to_sf: HashMap<String, String>,
     pub seen_call_pairs: HashSet<(String, String)>,
+
+    /// C#'s `namespace_stack`. Every id minted from the file stem carries the
+    /// enclosing namespace (`_make_id(stem, ".".join(namespace_stack), name)`),
+    /// and `add_node` stamps it as `metadata.namespace`. Empty for every other
+    /// language on this engine, where the joined middle part is `""` and
+    /// `make_id` drops it -- so the ids are unchanged by its presence.
+    pub namespace_stack: Vec<String>,
+    /// C#'s `scope_stack`: one `s<start_byte>` entry per enclosing namespace,
+    /// stamped on every non-namespace node as `metadata.scope_chain` and read by
+    /// the `using` import handler for `scope_kind` / `scope_id`.
+    pub scope_stack: Vec<String>,
+    /// Whatever `LangHooks::prescan` collected for this file. C#: the names
+    /// declared as `interface` here.
+    pub prescan: HashSet<String>,
+
+    /// The include resolver, for the languages that have one. `None` makes any
+    /// file that needs it defer, which is the same rule the JS and Python
+    /// resolvers follow: resolution has no safe default.
+    pub path_resolver: Option<&'a dyn PathResolver>,
 }
 
 impl<'a, 'tree> Ctx<'a, 'tree> {
@@ -259,18 +394,48 @@ impl<'a, 'tree> Ctx<'a, 'tree> {
         text_checked(node, self.src).ok_or("invalid_utf8_text")
     }
 
-    /// `add_node`. `metadata`, `type` and `scope_chain` are only ever set by the
-    /// C# namespace handler, so the extra fields arrive through `class_metadata`
-    /// rather than being assumed absent.
-    pub fn add_node_meta(
+    /// The joined namespace: `".".join(namespace_stack)`.
+    pub fn ns(&self) -> String {
+        self.namespace_stack.join(".")
+    }
+
+    /// `add_node`, whole.
+    ///
+    /// The namespace / scope_chain merge is NOT optional or C#-specific in the
+    /// Python: `add_node` applies it to every node it mints, including functions,
+    /// properties and enum members. It is a no-op for a language that never
+    /// pushes either stack, which is every language on this engine but C#.
+    ///
+    /// Key order is Python's: `id, label, file_type, source_file,
+    /// source_location, [type], [metadata]`, with `metadata`'s own keys in the
+    /// order `dict(metadata)` then the two `setdefault`s produce.
+    pub fn add_node_full(
         &mut self,
         nid: &str,
         label: &str,
         line: usize,
-        extra: Vec<(&'static str, Val)>,
+        node_type: Option<&'static str>,
+        metadata: Vec<(&'static str, Val)>,
     ) {
         if !self.seen_ids.insert(nid.to_string()) {
             return;
+        }
+        let mut merged: Vec<(String, Val)> = metadata
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        // `setdefault`: an explicit entry of the same name wins.
+        if !self.namespace_stack.is_empty() && !merged.iter().any(|(k, _)| k == "namespace") {
+            merged.push(("namespace".to_string(), Val::S(self.ns())));
+        }
+        if !self.scope_stack.is_empty()
+            && node_type != Some("namespace")
+            && !merged.iter().any(|(k, _)| k == "scope_chain")
+        {
+            merged.push((
+                "scope_chain".to_string(),
+                Val::List(self.scope_stack.iter().map(|s| Val::S(s.clone())).collect()),
+            ));
         }
         let mut fields = vec![
             ("label", Val::S(label.to_string())),
@@ -278,15 +443,25 @@ impl<'a, 'tree> Ctx<'a, 'tree> {
             ("source_file", Val::S(self.str_path.to_string())),
             ("source_location", Val::S(format!("L{line}"))),
         ];
-        fields.extend(extra);
+        if let Some(t) = node_type {
+            fields.push(("type", Val::Static(t)));
+        }
+        // `if merged:` -- an empty dict adds no key at all.
+        if !merged.is_empty() {
+            fields.push(("metadata", Val::Meta(meta::sanitize(merged))));
+        }
         self.nodes.push(NodeRow {
             id: nid.to_string(),
             fields,
         });
     }
 
+    pub fn add_node_meta(&mut self, nid: &str, label: &str, line: usize, metadata: Vec<(&'static str, Val)>) {
+        self.add_node_full(nid, label, line, None, metadata);
+    }
+
     pub fn add_node(&mut self, nid: &str, label: &str, line: usize) {
-        self.add_node_meta(nid, label, line, Vec::new());
+        self.add_node_full(nid, label, line, None, Vec::new());
     }
 
     pub fn add_edge(&mut self, src: &str, tgt: &str, relation: &'static str, line: usize) {
@@ -326,6 +501,40 @@ impl<'a, 'tree> Ctx<'a, 'tree> {
         });
     }
 
+    /// `add_edge(..., context=..., metadata=...)`: `context` then `metadata`,
+    /// both last and both conditional on being non-empty -- the Python appends
+    /// each only under `if context:` / `if metadata:`.
+    pub fn add_edge_meta(
+        &mut self,
+        src: &str,
+        tgt: &str,
+        relation: &'static str,
+        line: usize,
+        context: Option<&'static str>,
+        metadata: Vec<(&'static str, Val)>,
+    ) {
+        let mut fields = vec![
+            ("confidence", Val::Static("EXTRACTED")),
+            ("source_file", Val::S(self.str_path.to_string())),
+            ("source_location", Val::S(format!("L{line}"))),
+            ("weight", Val::F(1.0)),
+        ];
+        if let Some(c) = context {
+            fields.push(("context", Val::Static(c)));
+        }
+        if !metadata.is_empty() {
+            let owned: Vec<(String, Val)> =
+                metadata.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+            fields.push(("metadata", Val::Meta(meta::sanitize(owned))));
+        }
+        self.edges.push(EdgeRow {
+            source: src.to_string(),
+            target: tgt.to_string(),
+            relation,
+            fields,
+        });
+    }
+
     /// The import edge appended directly by a handler: `context` THIRD, right
     /// after `relation`. A different key order from `add_edge_ctx`, and the
     /// order reaches the pickled result, so it is its own emitter.
@@ -347,10 +556,11 @@ impl<'a, 'tree> Ctx<'a, 'tree> {
 
     /// `ensure_named_node`: a SOURCELESS stub when the name is not defined in
     /// this file, so the corpus-level rewire can collapse it onto the real
-    /// definition (#1402). `namespace_stack` is empty for every language ported
-    /// here, so the scoped probe is `_make_id(stem, "", name)`.
+    /// definition (#1402). The scoped probe is `_make_id(stem,
+    /// ".".join(namespace_stack), name)`; outside C# the middle part is `""` and
+    /// `make_id` drops it.
     pub fn ensure_named_node(&mut self, name: &str, _line: usize) -> R<String> {
-        let scoped = self.mkid(&[&self.stem.clone(), "", name])?;
+        let scoped = self.mkid(&[&self.stem.clone(), &self.ns(), name])?;
         if self.seen_ids.contains(&scoped) {
             return Ok(scoped);
         }
@@ -376,6 +586,35 @@ impl<'a, 'tree> Ctx<'a, 'tree> {
     /// the scoped probe omits the empty namespace part.
     pub fn ensure_parent_node(&mut self, name: &str) -> R<String> {
         let scoped = self.mkid(&[&self.stem.clone(), name])?;
+        if self.seen_ids.contains(&scoped) {
+            return Ok(scoped);
+        }
+        let bare = self.mkid(&[name])?;
+        if !self.seen_ids.contains(&bare) {
+            self.seen_ids.insert(bare.clone());
+            self.nodes.push(NodeRow {
+                id: bare.clone(),
+                fields: vec![
+                    ("label", Val::S(name.to_string())),
+                    ("file_type", Val::Static("code")),
+                    ("source_file", Val::Static("")),
+                    ("source_location", Val::Static("")),
+                ],
+            });
+        }
+        Ok(bare)
+    }
+
+    /// C#'s base-type stub, from the `base_list` block.
+    ///
+    /// A third variant, not a redundant one: the scoped probe is the THREE-part
+    /// `_make_id(stem, namespace, base)` (where `ensure_parent_node` uses two),
+    /// and the stub carries no `origin_file` (where `ensure_named_node` does).
+    /// All three mint the same id when the namespace is empty and differ in node
+    /// SHAPE, which is exactly the kind of difference a per-file parity run sees
+    /// and a casual reading does not.
+    pub fn ensure_scoped_stub(&mut self, name: &str) -> R<String> {
+        let scoped = self.mkid(&[&self.stem.clone(), &self.ns(), name])?;
         if self.seen_ids.contains(&scoped) {
             return Ok(scoped);
         }
@@ -441,9 +680,10 @@ pub fn run<'py>(
     cfg: &'static EngineConfig,
     path: &str,
     source: &[u8],
-    receiver_types_for: fn(&Ctx, Node, &HashMap<String, String>) -> R<HashMap<String, String>>,
+    receiver_types_for: fn(&Ctx, Node, &HashMap<String, String>) -> R<RecvTable>,
+    path_resolver: Option<&dyn PathResolver>,
 ) -> PyResult<Outcome<'py>> {
-    match extract(py, cfg, path, source, receiver_types_for) {
+    match extract(py, cfg, path, source, receiver_types_for, path_resolver) {
         Ok(dict) => Ok(Outcome::Native(dict)),
         Err(reason) => Ok(Outcome::Defer(reason)),
     }
@@ -454,7 +694,8 @@ fn extract<'py>(
     cfg: &'static EngineConfig,
     path: &str,
     source: &[u8],
-    receiver_types_for: fn(&Ctx, Node, &HashMap<String, String>) -> R<HashMap<String, String>>,
+    receiver_types_for: fn(&Ctx, Node, &HashMap<String, String>) -> R<RecvTable>,
+    path_resolver: Option<&dyn PathResolver>,
 ) -> Result<Bound<'py, PyDict>, &'static str> {
     // One validation of the whole buffer makes every later `text()` sound by
     // construction -- see `js::extract` for the U+FFFD divergence this prevents.
@@ -497,7 +738,15 @@ fn extract<'py>(
         label_to_nid: HashMap::new(),
         nid_to_sf: HashMap::new(),
         seen_call_pairs: HashSet::new(),
+        namespace_stack: Vec::new(),
+        scope_stack: Vec::new(),
+        prescan: HashSet::new(),
+        path_resolver,
     };
+
+    // Before the file node, as in Python: `_csharp_pre_scan_interfaces(root,
+    // source)` runs above `add_node(file_nid, ...)`.
+    ctx.prescan = cfg.hooks.prescan(&ctx, root)?;
 
     let file_label = path.rsplit('/').next().unwrap_or(path).to_string();
     ctx.add_node(&file_nid, &file_label, 1);
@@ -531,17 +780,18 @@ fn extract<'py>(
         .map(|(k, (n, c))| (*k, (*n, c.clone())))
         .collect();
     let empty: HashMap<String, String> = HashMap::new();
-    let mut tables: HashMap<(usize, usize), HashMap<String, String>> = HashMap::new();
+    let mut tables: HashMap<(usize, usize), RecvTable> = HashMap::new();
     for (body_key, (method_node, class_nid)) in scopes {
         let fields = ctx.field_types.get(&class_nid).unwrap_or(&empty).clone();
         tables.insert(body_key, receiver_types_for(&ctx, method_node, &fields)?);
     }
 
     let bodies: Vec<(String, Node)> = ctx.function_bodies.clone();
+    let no_table = RecvTable::default();
     for (caller_nid, body) in bodies {
         let key = (body.start_byte(), body.end_byte());
-        let table = tables.get(&key).cloned().unwrap_or_default();
-        calls::walk_calls(&mut ctx, body, &caller_nid, &table)?;
+        let table = tables.get(&key).unwrap_or(&no_table);
+        calls::walk_calls(&mut ctx, body, &caller_nid, table)?;
     }
 
     // ── Clean edges ─────────────────────────────────────────────────────────
@@ -581,11 +831,24 @@ fn extract<'py>(
     Ok(out)
 }
 
+/// Every language driven by this engine, for the seam test to compare against
+/// the `LanguageConfig` it is meant to mirror.
+///
+/// A hand-written walker (`js/`, `py/`) HARD-CODES its dispatch sets, so the
+/// seam test can only assert that the Python config's optional fields are empty
+/// -- the walker would ignore them. An engine-driven language is the opposite:
+/// every one of these fields is READ from the config at run time, so the test
+/// can check the real thing, field for field. That check gets stronger with each
+/// language added rather than needing a new exemption.
+pub fn engine_configs() -> Vec<&'static EngineConfig> {
+    vec![&crate::java::CONFIG, &crate::csharp::CONFIG, &crate::c::CONFIG]
+}
+
 /// The default for a language that builds no receiver table.
 pub fn no_receiver_types(
     _ctx: &Ctx,
     _method_node: Node,
     _fields: &HashMap<String, String>,
-) -> R<HashMap<String, String>> {
-    Ok(HashMap::new())
+) -> R<RecvTable> {
+    Ok(RecvTable::default())
 }

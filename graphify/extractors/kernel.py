@@ -57,6 +57,8 @@ _GRAMMAR_TO_LANGUAGE: dict[tuple[str, str], str] = {
     ("tree_sitter_javascript", "language"): "javascript",
     ("tree_sitter_python", "language"): "python",
     ("tree_sitter_java", "language"): "java",
+    ("tree_sitter_c_sharp", "language"): "csharp",
+    ("tree_sitter_c", "language"): "c",
 }
 
 # The reverse map, for the grammar-version check below: kernel language key ->
@@ -222,6 +224,24 @@ def _bind_resolver_helpers() -> None:
     _resolve_js_module_path = _m
     _py_file_stem = _file_stem
     _probe_python_module = _probe_python_module_candidate
+
+
+def _c_include_resolver(str_path: str) -> Callable[[str], str | None]:
+    """A `(raw) -> resolved-path-string | None` callable for one C file.
+
+    `_resolve_c_include_path` is `Path(str_path).parent / raw` through
+    `resolve_cached` plus an `is_file()` probe -- symlink resolution, `..`
+    normalization and a disk hit, none of which the native walker may do itself.
+    It calls Graphify's own function so the resolution cannot drift from the
+    Python path, the same arrangement `_import_resolver` uses for JS.
+    """
+    from graphify.extractors.resolution import _resolve_c_include_path
+
+    def _resolve(raw: str) -> str | None:
+        target = _resolve_c_include_path(raw, str_path)
+        return None if target is None else str(target)
+
+    return _resolve
 
 
 def _module_resolver(str_path: str) -> Callable[[str], str | None]:
@@ -513,7 +533,7 @@ def try_extract(path: Path, config: Any,
         result, reason = mod.extract_file(
             str_path, source, language,
             _import_resolver(str_path), _module_resolver(str_path),
-            _py_import_resolver(str_path),
+            _py_import_resolver(str_path), _c_include_resolver(str_path),
         )
     except BaseException as exc:
         # BaseException, not Exception, and deliberately so.

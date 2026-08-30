@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
 use super::helpers;
-use crate::engine::{Ctx, R};
+use crate::engine::{Ctx, RecvTable, R};
 use crate::js::ast::children;
 use crate::js::emit::{RawCall, Val};
 use crate::py::helpers::BUILTIN_GLOBALS;
@@ -37,7 +37,7 @@ pub fn method_receiver_types(
     ctx: &Ctx,
     method_node: Node,
     field_types: &HashMap<String, String>,
-) -> R<HashMap<String, String>> {
+) -> R<RecvTable> {
     let mut method_types: HashMap<String, String> = HashMap::new();
     let mut ambiguous: HashSet<String> = HashSet::new();
 
@@ -139,7 +139,9 @@ pub fn method_receiver_types(
     for (name, type_name) in field_types {
         table.insert(format!("this.{name}"), type_name.clone());
     }
-    Ok(table)
+    // Flat: a Java binding is method-wide, so the call offset never enters the
+    // lookup. C#'s is positional -- see `RecvTable`.
+    Ok(RecvTable::Flat(table))
 }
 
 /// `_java_lambda_parameters`.

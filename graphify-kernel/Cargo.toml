@@ -23,6 +23,11 @@ tree-sitter-python = "0.25"
 # field_count) as the installed Python package before being added -- see
 # `languages::grammar_fingerprints`, which re-checks it at load time.
 tree-sitter-java = "0.23.5"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-c = "0.24.2"
+# `_csharp_namespace_id` is `sha1(dotted_name).hexdigest()[:16]`, so the digest
+# is part of the node id and has to be the real thing.
+sha1 = "0.10"
 
 [profile.release]
 opt-level = 3

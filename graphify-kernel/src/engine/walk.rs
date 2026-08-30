@@ -56,9 +56,9 @@ pub fn walk<'tree>(
             None => return Ok(()),
         };
         let class_name = ctx.text(name_node)?.to_string();
-        // `namespace_stack` is empty for every language on this engine, so the
-        // joined middle part is "" and `make_id` drops it.
-        let class_nid = ctx.mkid(&[&ctx.stem.clone(), "", &class_name])?;
+        // `_make_id(stem, ".".join(namespace_stack), class_name)`. Outside C# the
+        // middle part is "" and `make_id` drops it.
+        let class_nid = ctx.mkid(&[&ctx.stem.clone(), &ctx.ns(), &class_name])?;
         let line = node.start_position().row + 1;
         let metadata = hooks.class_metadata(ctx, node, parent_class_nid)?;
         ctx.add_node_meta(&class_nid, &class_name, line, metadata);
@@ -98,6 +98,17 @@ pub fn walk<'tree>(
         let func_name: Option<String> = match t {
             "deinit_declaration" => Some("deinit".to_string()),
             "subscript_declaration" => Some("subscript".to_string()),
+            // C/C++ style: the name is the innermost identifier of the
+            // `declarator`, not a `name` field. An elif in the Python, so it
+            // REPLACES the name-field lookup rather than falling back to it --
+            // a declaration with no declarator yields None and is skipped.
+            _ if ctx.cfg.resolve_function_name.is_some() => {
+                let resolve = ctx.cfg.resolve_function_name.unwrap();
+                match node.child_by_field_name("declarator") {
+                    Some(d) => resolve(ctx, d)?,
+                    None => None,
+                }
+            }
             _ => match find_name(ctx, node) {
                 Some(n) => Some(ctx.text(n)?.to_string()),
                 None => None,

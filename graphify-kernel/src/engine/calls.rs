@@ -5,11 +5,9 @@
 //! callee and receiver, deciding whether to defer, and stamping extra keys on
 //! the raw_call.
 
-use std::collections::HashMap;
-
 use tree_sitter::Node;
 
-use super::{has, CallInfo, Ctx, R};
+use super::{has, CallInfo, Ctx, RecvTable, R};
 use crate::js::ast::children;
 use crate::js::emit::{EdgeRow, RawCall, Val};
 use crate::py::helpers::BUILTIN_GLOBALS;
@@ -77,7 +75,7 @@ pub fn walk_calls<'tree>(
     ctx: &mut Ctx<'_, 'tree>,
     node: Node<'tree>,
     caller_nid: &str,
-    receiver_types: &HashMap<String, String>,
+    receiver_types: &RecvTable,
 ) -> R<()> {
     let hooks = ctx.cfg.hooks;
 
@@ -88,7 +86,7 @@ pub fn walk_calls<'tree>(
     }
 
     if has(ctx.cfg.call_types, node.kind()) {
-        let info = match hooks.call_info(ctx, node)? {
+        let info = match hooks.call_info(ctx, node, caller_nid)? {
             Some(i) => i,
             None => generic_call_info(ctx, node)?,
         };
@@ -110,7 +108,8 @@ pub fn walk_calls<'tree>(
                 let tgt_nid = if hooks.defers(&info) || generic_defer {
                     None
                 } else {
-                    ctx.label_to_nid.get(&callee).cloned()
+                    let looked_up = ctx.label_to_nid.get(&callee).cloned();
+                    hooks.refine_target(ctx, &info, looked_up)
                 };
 
                 match tgt_nid {
@@ -160,7 +159,7 @@ pub fn walk_calls<'tree>(
                                 },
                             ),
                         ];
-                        rc.extend(hooks.raw_call_extra(ctx, &info, receiver_types));
+                        rc.extend(hooks.raw_call_extra(ctx, node, &info, receiver_types));
                         ctx.raw_calls.push(rc);
                     }
                 }

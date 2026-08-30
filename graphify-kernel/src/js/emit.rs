@@ -32,17 +32,45 @@ pub enum Val {
     F(f64),
     B(bool),
     None,
+    /// A JSON list. Only `scope_chain` uses it: C#'s `add_node` stamps
+    /// `list(scope_stack)` on every node declared inside a namespace.
+    List(Vec<Val>),
+    /// A nested dict, in insertion order -- the `metadata` block. Keys are
+    /// owned `String` rather than `&'static str` because C# metadata keys come
+    /// from `sanitize_metadata`, which rewrites them.
+    Meta(Vec<(String, Val)>),
 }
 
 impl Val {
+    fn to_py<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        Ok(match self {
+            Val::S(s) => s.into_pyobject(py)?.into_any(),
+            Val::Static(s) => (*s).into_pyobject(py)?.into_any(),
+            Val::F(f) => f.into_pyobject(py)?.into_any(),
+            // `bool` converts to the SINGLETON `Py_True`/`Py_False`, whose
+            // `into_pyobject` yields a `Borrowed`; `.to_owned()` makes the two
+            // match arms one type.
+            Val::B(b) => b.into_pyobject(py)?.to_owned().into_any(),
+            Val::None => py.None().into_bound(py),
+            Val::List(items) => {
+                let l = pyo3::types::PyList::empty(py);
+                for it in items {
+                    l.append(it.to_py(py)?)?;
+                }
+                l.into_any()
+            }
+            Val::Meta(pairs) => {
+                let d = PyDict::new(py);
+                for (k, v) in pairs {
+                    d.set_item(k, v.to_py(py)?)?;
+                }
+                d.into_any()
+            }
+        })
+    }
+
     fn set(&self, d: &Bound<'_, PyDict>, key: &str) -> PyResult<()> {
-        match self {
-            Val::S(s) => d.set_item(key, s),
-            Val::Static(s) => d.set_item(key, *s),
-            Val::F(f) => d.set_item(key, *f),
-            Val::B(b) => d.set_item(key, *b),
-            Val::None => d.set_item(key, d.py().None()),
-        }
+        d.set_item(key, self.to_py(d.py())?)
     }
 }
 

@@ -31,6 +31,8 @@ use pyo3::types::{PyDict, PyList};
 
 mod engine;
 mod ids;
+mod c;
+mod csharp;
 mod java;
 mod js;
 mod languages;
@@ -68,6 +70,7 @@ pub fn defer<'py>(reason: &'static str) -> PyResult<Outcome<'py>> {
 pub struct Resolvers<'py> {
     pub js: js::imports::Resolver<'py>,
     pub py: py::imports::Resolver<'py>,
+    pub c: c::imports::Resolver<'py>,
 }
 
 /// The kernel's own version, independent of Graphify's. Bumped whenever the
@@ -117,7 +120,7 @@ fn supported_languages() -> Vec<&'static str> {
 /// silently wrong. Omitting it makes any Python file containing a relative import
 /// defer, since there is no safe default for where it points.
 #[pyfunction]
-#[pyo3(signature = (path, source, language, resolve_import=None, resolve_module=None, resolve_py_import=None))]
+#[pyo3(signature = (path, source, language, resolve_import=None, resolve_module=None, resolve_py_import=None, resolve_c_include=None))]
 fn extract_file<'py>(
     py: Python<'py>,
     path: &str,
@@ -126,10 +129,12 @@ fn extract_file<'py>(
     resolve_import: Option<Bound<'py, PyAny>>,
     resolve_module: Option<Bound<'py, PyAny>>,
     resolve_py_import: Option<Bound<'py, PyAny>>,
+    resolve_c_include: Option<Bound<'py, PyAny>>,
 ) -> PyResult<(Option<Bound<'py, PyDict>>, Option<&'static str>)> {
     let res = Resolvers {
         js: js::imports::Resolver::new(resolve_import, resolve_module),
         py: py::imports::Resolver::new(resolve_py_import),
+        c: c::imports::Resolver::new(resolve_c_include),
     };
     match languages::walker_for(language) {
         None => Ok((None, Some("no_walker"))),
@@ -159,6 +164,50 @@ fn selftest<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         fps.set_item(name, (abi, kinds, fields))?;
     }
     out.set_item("grammars", fps)?;
+    Ok(out)
+}
+
+/// The dispatch sets of every engine-driven language, keyed by language.
+///
+/// `tests/test_kernel_seam.py` compares these against the `LanguageConfig` the
+/// walker is meant to mirror. Routing on `(ts_module, ts_language_fn)` proves
+/// the two sides load the same GRAMMAR; this proves they dispatch on the same
+/// NODE KINDS, which routing alone never did.
+#[pyfunction]
+fn engine_configs<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    for cfg in engine::engine_configs() {
+        let d = PyDict::new(py);
+        d.set_item("class_types", PyList::new(py, cfg.class_types)?)?;
+        d.set_item("function_types", PyList::new(py, cfg.function_types)?)?;
+        d.set_item("import_types", PyList::new(py, cfg.import_types)?)?;
+        d.set_item("call_types", PyList::new(py, cfg.call_types)?)?;
+        d.set_item(
+            "function_boundary_types",
+            PyList::new(py, cfg.function_boundary_types)?,
+        )?;
+        d.set_item("name_field", cfg.name_field)?;
+        d.set_item(
+            "name_fallback_child_types",
+            PyList::new(py, cfg.name_fallback_child_types)?,
+        )?;
+        d.set_item("body_field", cfg.body_field)?;
+        d.set_item(
+            "body_fallback_child_types",
+            PyList::new(py, cfg.body_fallback_child_types)?,
+        )?;
+        d.set_item("call_function_field", cfg.call_function_field)?;
+        d.set_item(
+            "call_accessor_node_types",
+            PyList::new(py, cfg.call_accessor_node_types)?,
+        )?;
+        d.set_item("call_accessor_field", cfg.call_accessor_field)?;
+        d.set_item("call_accessor_object_field", cfg.call_accessor_object_field)?;
+        d.set_item("function_label_parens", cfg.function_label_parens)?;
+        // PRESENCE, not the function itself: `None` selects a different branch.
+        d.set_item("resolve_function_name", cfg.resolve_function_name.is_some())?;
+        out.set_item(cfg.language, d)?;
+    }
     Ok(out)
 }
 
@@ -217,6 +266,7 @@ fn graphify_kernel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(supported_languages, m)?)?;
     m.add_function(wrap_pyfunction!(extract_file, m)?)?;
     m.add_function(wrap_pyfunction!(selftest, m)?)?;
+    m.add_function(wrap_pyfunction!(engine_configs, m)?)?;
     m.add_function(wrap_pyfunction!(debug_make_id, m)?)?;
     m.add_function(wrap_pyfunction!(debug_file_stem, m)?)?;
     m.add_function(wrap_pyfunction!(debug_panic, m)?)?;
