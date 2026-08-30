@@ -135,7 +135,7 @@ def _read_tsconfig_aliases(tsconfig: Path, base_dir: Path, seen: set) -> dict[st
         # Skip scoped npm package configs (e.g. @tsconfig/svelte) — not on disk.
         if not ext or ext.startswith("@"):
             continue
-        extended_path = (base_dir / ext).resolve()
+        extended_path = resolve_cached(base_dir / ext)
         if not extended_path.suffix:
             extended_path = extended_path.with_suffix(".json")
         if extended_path.exists():
@@ -198,7 +198,7 @@ def _find_js_config(start_dir: Path) -> "tuple[Path, Path] | None":
     tsconfig.json wins when both sit in one directory, matching tsc and editors,
     which consult jsconfig.json only when there is no tsconfig.json.
     """
-    current = start_dir.resolve()
+    current = resolve_cached(start_dir)
     for candidate in [current, *current.parents]:
         for name in ("tsconfig.json", "jsconfig.json"):
             config = candidate / name
@@ -328,7 +328,7 @@ def _resolve_tsconfig_alias(raw: str, aliases: dict[str, list[str]],
     return first
 
 def _find_workspace_root(start_dir: Path) -> Path | None:
-    current = start_dir.resolve()
+    current = resolve_cached(start_dir)
     for candidate in [current, *current.parents]:
         if (candidate / "pnpm-workspace.yaml").exists():
             return candidate
@@ -437,7 +437,7 @@ def _contained_in_package(resolved: Path, package_dir: Path) -> bool:
     (e.g. "./evil": "../../../etc/passwd"). Only accept paths that stay
     within package_dir after resolution."""
     try:
-        return resolved.resolve().is_relative_to(package_dir.resolve())
+        return resolve_cached(resolved).is_relative_to(resolve_cached(package_dir))
     except ValueError:
         return False
 
@@ -566,7 +566,7 @@ def _resolve_c_include_path(raw: str, str_path: str) -> "Path | None":
     """
     if not raw:
         return None
-    candidate = (Path(str_path).parent / raw).resolve()
+    candidate = resolve_cached(Path(str_path).parent / raw)
     if candidate.is_file():
         return candidate
     return None
@@ -848,9 +848,11 @@ def _is_type_like_definition(node: dict) -> bool:
 # server call extract() repeatedly in ONE process, so a cache that outlives the
 # run re-answers with a path that was resolved through a symlink that no longer
 # exists. That is not a stale-performance problem, it is wrong output: the key
-# stops joining with ensure_symbol_node's live `path.resolve()`, the lookup
-# misses, and a DUPLICATE symbol node is appended while the call edge that
-# should have pointed at the original is lost.
+# stops joining with ensure_symbol_node's own resolve of the same path, the
+# lookup misses, and a DUPLICATE symbol node is appended while the call edge that
+# should have pointed at the original is lost. Both sides now go through
+# `resolve_cached`, so they share one answer and one lifecycle rather than
+# agreeing by coincidence.
 _JS_SOURCE_PATH_CACHE: dict[tuple[str, str], "Path | None"] = {}
 _JS_SOURCE_PATH_CACHE_MAX = 65536
 
@@ -906,7 +908,7 @@ def _apply_symbol_resolution_facts(
             symbol_nodes[(source_path, label)] = str(node["id"])
 
     def ensure_symbol_node(path: Path, name: str, line: int) -> str:
-        resolved_path = path.resolve()
+        resolved_path = resolve_cached(path)
         existing = symbol_nodes.get((resolved_path, name))
         if existing is not None:
             return existing
@@ -963,15 +965,15 @@ def _apply_symbol_resolution_facts(
 
     local_aliases_by_file: dict[Path, dict[str, tuple[Path, str]]] = {}
     for import_fact in facts.imports:
-        file_path = import_fact.file_path.resolve()
+        file_path = resolve_cached(import_fact.file_path)
         local_aliases_by_file.setdefault(file_path, {})[import_fact.local_name] = (
-            import_fact.target_path.resolve(),
+            resolve_cached(import_fact.target_path),
             import_fact.imported_name,
         )
 
     pending_aliases_by_file: dict[Path, list[_SymbolAliasFact]] = {}
     for alias_fact in facts.aliases:
-        pending_aliases_by_file.setdefault(alias_fact.file_path.resolve(), []).append(alias_fact)
+        pending_aliases_by_file.setdefault(resolve_cached(alias_fact.file_path), []).append(alias_fact)
 
     for file_path, aliases in pending_aliases_by_file.items():
         local_aliases = local_aliases_by_file.setdefault(file_path, {})
@@ -990,8 +992,8 @@ def _apply_symbol_resolution_facts(
     star_exports_by_file: dict[Path, list[Path]] = {}
 
     for star_fact in facts.star_exports:
-        source_path = star_fact.file_path.resolve()
-        target_path = star_fact.target_path.resolve()
+        source_path = resolve_cached(star_fact.file_path)
+        target_path = resolve_cached(star_fact.target_path)
         star_exports_by_file.setdefault(source_path, []).append(target_path)
         source_id = source_file_id.get(source_path)
         if source_id is not None:
@@ -1006,8 +1008,8 @@ def _apply_symbol_resolution_facts(
             )
 
     for namespace_fact in facts.namespace_exports:
-        source_path = namespace_fact.file_path.resolve()
-        target_path = namespace_fact.target_path.resolve()
+        source_path = resolve_cached(namespace_fact.file_path)
+        target_path = resolve_cached(namespace_fact.target_path)
         namespace_id = ensure_symbol_node(
             namespace_fact.file_path,
             namespace_fact.exported_name,
@@ -1037,10 +1039,10 @@ def _apply_symbol_resolution_facts(
             )
 
     for export_fact in facts.exports:
-        file_path = export_fact.file_path.resolve()
+        file_path = resolve_cached(export_fact.file_path)
         origin: tuple[Path, str] | None = None
         if export_fact.target_path is not None and export_fact.target_name is not None:
-            origin = (export_fact.target_path.resolve(), export_fact.target_name)
+            origin = (resolve_cached(export_fact.target_path), export_fact.target_name)
         elif export_fact.local_name is not None:
             origin = local_aliases_by_file.get(file_path, {}).get(export_fact.local_name)
             if origin is None and (file_path, export_fact.local_name) in symbol_nodes:
@@ -1062,7 +1064,7 @@ def _apply_symbol_resolution_facts(
                 )
 
     def resolve_exported_origin(target_path: Path, imported_name: str, seen: set[tuple[Path, str]] | None = None) -> tuple[Path, str]:
-        target_path = target_path.resolve()
+        target_path = resolve_cached(target_path)
         key = (target_path, imported_name)
         if seen is None:
             seen = set()
@@ -1082,7 +1084,7 @@ def _apply_symbol_resolution_facts(
         return key
 
     for import_fact in facts.imports:
-        source_id = source_file_id.get(import_fact.file_path.resolve())
+        source_id = source_file_id.get(resolve_cached(import_fact.file_path))
         if source_id is None:
             continue
         origin_path, origin_symbol = resolve_exported_origin(
@@ -1569,7 +1571,7 @@ def _collect_js_facts_one_file(path: Path) -> "tuple[_SymbolResolutionFacts, _Sy
             target_path = _resolve_js_module_path(raw_module, path.parent)
             if target_path is None:
                 continue
-            target_path = target_path.resolve()
+            target_path = resolve_cached(target_path)
             for imported_name, local_name in _js_named_specifiers(node, source, "import_specifier"):
                 facts.imports.append(
                     _SymbolImportFact(
@@ -1607,7 +1609,7 @@ def _collect_js_facts_one_file(path: Path) -> "tuple[_SymbolResolutionFacts, _Sy
                 target_path = _resolve_js_module_path(raw_module, path.parent)
                 if target_path is None:
                     continue
-                target_path = target_path.resolve()
+                target_path = resolve_cached(target_path)
                 namespace_name = _js_namespace_export_name(node, source)
                 if namespace_name is not None:
                     facts.namespace_exports.append(
@@ -2809,7 +2811,7 @@ def _go_import_path_for_file(
     if not path.is_absolute():
         path = root / path
     try:
-        directory = path.resolve().parent
+        directory = resolve_cached(path).parent
     except OSError:
         directory = path.absolute().parent
 
