@@ -151,15 +151,30 @@ def test_ungated_language_defers_and_is_counted(monkeypatch):
 
 
 def test_unknown_grammar_never_reaches_the_kernel(monkeypatch):
-    """A language with no mapping must not even trigger the module load."""
-    monkeypatch.delenv("GRAPHIFY_KERNEL", raising=False)
+    """A language with no mapping must not even trigger the module load.
 
-    class _Go:
-        ts_module = "tree_sitter_go"
+    The example grammar is chosen from the ones that are NOT routed, rather than
+    named: this test previously hard-coded `tree_sitter_go`, which stopped being
+    unrouted the day Go was ported and turned a real invariant into a false
+    failure. Picking an unrouted one keeps the test about the invariant.
+    """
+    monkeypatch.delenv("GRAPHIFY_KERNEL", raising=False)
+    from graphify.extractors.kernel import _GRAMMAR_TO_LANGUAGE
+
+    unrouted = next(
+        (m for m in ("tree_sitter_zig", "tree_sitter_dart", "tree_sitter_elixir",
+                     "tree_sitter_ocaml", "tree_sitter_julia")
+         if (m, "language") not in _GRAMMAR_TO_LANGUAGE),
+        None,
+    )
+    assert unrouted is not None, "every candidate grammar is now routed"
+
+    class _Unrouted:
+        ts_module = unrouted
         ts_language_fn = "language"
 
-    assert kernel.language_for(_Go()) is None
-    assert kernel.try_extract(Path("a.go"), _Go()) is None
+    assert kernel.language_for(_Unrouted()) is None
+    assert kernel.try_extract(Path("a.xx"), _Unrouted()) is None
     assert kernel.drain_counts() == {}
 
 
