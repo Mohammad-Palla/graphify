@@ -37,6 +37,7 @@ mod cpp;
 mod csharp;
 mod go;
 mod php;
+mod rust;
 mod java;
 mod js;
 mod languages;

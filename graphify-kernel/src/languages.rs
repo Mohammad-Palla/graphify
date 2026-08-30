@@ -65,6 +65,10 @@ pub type Walker = for<'py> fn(
 /// k8s      go           17865   99.3%      0.7%          0
 /// prometheus go           730  100.0%      0.0%          0
 /// gin      go              99  100.0%      0.0%          0
+/// cargo    rust          1373   62.0%     38.0%          0
+/// tokio    rust           793  100.0%      0.0%          0
+/// bun      rust          1527   87.9%     12.1%          0
+/// serde    rust           208  100.0%      0.0%          0
 /// redis    c              756   56.2%     43.8%          0
 /// curl     c             1014   73.7%     26.3%          0
 /// ```
@@ -102,6 +106,12 @@ pub type Walker = for<'py> fn(
 /// second bespoke walker and, unlike Bash, touches no filesystem at all, so
 /// there is no scope deferral -- every file the grammar parses is handled.
 ///
+/// Rust is the third bespoke walker. Its corpus spread is wide for one reason,
+/// and it is worth naming so the 62% is not read as a walker gap: 516 of cargo's
+/// 522 erroring files are under `tests/testsuite`, which embeds deliberately
+/// malformed Rust in string literals for the compiler to reject. tokio and serde
+/// are both 100%.
+///
 /// C#'s deferral rate is an order of magnitude above every other language's and
 /// it is NOT a gap in the walker: 8.2% of those 7,177 files make
 /// `tree-sitter-c-sharp` 0.23.5 produce an ERROR node, and Python's recovery is
@@ -131,7 +141,7 @@ pub type Walker = for<'py> fn(
 pub fn supported() -> Vec<&'static str> {
     vec![
         "typescript", "tsx", "javascript", "python", "java", "csharp", "c", "cpp",
-        "php", "bash", "go",
+        "php", "bash", "go", "rust",
     ]
 }
 
@@ -148,6 +158,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
         "php" => Some(crate::php::walk_php),
         "bash" => Some(crate::bash::walk_bash),
         "go" => Some(crate::go::walk_go),
+        "rust" => Some(crate::rust::walk_rust),
         _ => None,
     }
 }
@@ -173,7 +184,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
 /// The node-kind and field counts change with essentially any grammar revision,
 /// which is what makes the triple a usable proxy for "same grammar".
 pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
-    let langs: [(&'static str, tree_sitter::Language); 11] = [
+    let langs: [(&'static str, tree_sitter::Language); 12] = [
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ("javascript", tree_sitter_javascript::LANGUAGE.into()),
@@ -185,6 +196,7 @@ pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
         ("php", tree_sitter_php::LANGUAGE_PHP.into()),
         ("bash", tree_sitter_bash::LANGUAGE.into()),
         ("go", tree_sitter_go::LANGUAGE.into()),
+        ("rust", tree_sitter_rust::LANGUAGE.into()),
     ];
     langs
         .iter()

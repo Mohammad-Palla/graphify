@@ -63,6 +63,7 @@ _GRAMMAR_TO_LANGUAGE: dict[tuple[str, str], str] = {
     ("tree_sitter_php", "language_php"): "php",
     ("tree_sitter_bash", "language"): "bash",
     ("tree_sitter_go", "language"): "go",
+    ("tree_sitter_rust", "language"): "rust",
 }
 
 # The reverse map, for the grammar-version check below: kernel language key ->

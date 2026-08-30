@@ -3,6 +3,7 @@ from __future__ import annotations
 
 
 from pathlib import Path
+from graphify.extractors import kernel as _kernel
 from graphify.extractors.base import _LANGUAGE_BUILTIN_GLOBALS, _file_stem, _make_id, _read_text
 
 
@@ -58,8 +59,14 @@ _RUST_TRAIT_METHOD_BLOCKLIST: frozenset[str] = frozenset({
     "ok", "err", "some", "none", "send", "recv", "lock", "read", "write",
 })
 
+_KERNEL_GRAMMAR = _kernel.BespokeGrammar("tree_sitter_rust")
+
+
 def extract_rust(path: Path) -> dict:
     """Extract functions, structs, enums, traits, impl methods, and use declarations from a .rs file."""
+    native = _kernel.try_extract(path, _KERNEL_GRAMMAR)
+    if native is not None:
+        return native
     try:
         import tree_sitter_rust as tsrust
         from tree_sitter import Language, Parser
