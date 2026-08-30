@@ -37,6 +37,7 @@ mod cpp;
 mod csharp;
 mod go;
 mod php;
+mod ruby;
 mod rust;
 mod java;
 mod js;
@@ -221,6 +222,7 @@ fn engine_configs<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         d.set_item("function_label_parens", cfg.function_label_parens)?;
         // PRESENCE, not the function itself: `None` selects a different branch.
         d.set_item("resolve_function_name", cfg.resolve_function_name.is_some())?;
+        d.set_item("sanitize_symbol_name", cfg.sanitize_symbol_name.is_some())?;
         out.set_item(cfg.language, d)?;
     }
     Ok(out)

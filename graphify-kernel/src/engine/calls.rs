@@ -159,7 +159,7 @@ pub fn walk_calls<'tree>(
                                 },
                             ),
                         ];
-                        rc.extend(hooks.raw_call_extra(ctx, node, &info, receiver_types));
+                        rc.extend(hooks.raw_call_extra(ctx, node, caller_nid, &info, receiver_types));
                         ctx.raw_calls.push(rc);
                     }
                 }

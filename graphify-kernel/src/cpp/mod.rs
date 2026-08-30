@@ -286,6 +286,7 @@ impl LangHooks for Cpp {
         &self,
         _ctx: &Ctx<'_, 'tree>,
         _node: Node<'tree>,
+        _caller_nid: &str,
         _info: &CallInfo,
         _receiver_types: &RecvTable,
     ) -> Vec<(&'static str, Val)> {
@@ -317,6 +318,7 @@ pub static CONFIG: EngineConfig = EngineConfig {
     call_accessor_object_field: "",
     function_label_parens: true,
     resolve_function_name: Some(|ctx, node| helpers::func_name(ctx, node)),
+    sanitize_symbol_name: None,
     type_table_key: Some("cpp_type_table"),
     hooks: &HOOKS,
 };

@@ -583,6 +583,7 @@ impl LangHooks for CSharp {
         &self,
         _ctx: &Ctx<'_, 'tree>,
         node: Node<'tree>,
+        _caller_nid: &str,
         info: &CallInfo,
         receiver_types: &RecvTable,
     ) -> Vec<(&'static str, Val)> {
@@ -635,6 +636,7 @@ pub static CONFIG: EngineConfig = EngineConfig {
     call_accessor_object_field: "",
     function_label_parens: true,
     resolve_function_name: None,
+    sanitize_symbol_name: None,
     type_table_key: None,
     hooks: &HOOKS,
 };

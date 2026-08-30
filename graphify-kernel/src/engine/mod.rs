@@ -123,6 +123,11 @@ pub struct EngineConfig {
     /// "do nothing".
     pub resolve_function_name: Option<fn(&Ctx, Node) -> R<Option<String>>>,
 
+    /// `sanitize_symbol_name_fn`. Ruby encodes a trailing `!`, `?` or `=` into
+    /// a safe id component (#3077). The ID uses the sanitized name; the LABEL
+    /// keeps the raw one.
+    pub sanitize_symbol_name: Option<fn(&str) -> String>,
+
     /// The result key `Ctx::type_table` is emitted under, when non-empty --
     /// `"cpp_type_table"` for C++. `None` means the language builds no table, and
     /// the key is absent rather than empty, matching the Python's `elif
@@ -181,6 +186,16 @@ pub trait LangHooks {
         _parent_class_nid: Option<&str>,
     ) -> R<Vec<(&'static str, Val)>> {
         Ok(Vec::new())
+    }
+
+    /// Rewrite a class's LABEL against the enclosing scope, and return the
+    /// segments to push while its body is walked.
+    ///
+    /// Ruby alone: `module Billing; class Invoice` labels `Billing::Invoice`,
+    /// and a compact `class Billing::Invoice` splits into the same two segments
+    /// so both declaration styles converge on one label (#2302).
+    fn qualify_class_name(&self, _ctx: &Ctx, name: &str) -> R<(String, Vec<String>)> {
+        Ok((name.to_string(), Vec::new()))
     }
 
     /// The per-language class block: inheritance, interfaces, annotations,
@@ -276,6 +291,7 @@ pub trait LangHooks {
         &self,
         _ctx: &Ctx<'_, 'tree>,
         _node: Node<'tree>,
+        _caller_nid: &str,
         _info: &CallInfo,
         _receiver_types: &RecvTable,
     ) -> Vec<(&'static str, Val)> {
@@ -455,6 +471,22 @@ pub struct Ctx<'a, 'tree> {
     /// during the walk and resolved AFTER the call pass, because a Laravel
     /// `$listen` array names classes that may be declared later in the file.
     pub pending_listen_edges: Vec<(String, String, usize)>,
+
+    /// The enclosing class/module segments, for a language that QUALIFIES a
+    /// nested declaration's label. Ruby alone: `module Billing; class Invoice`
+    /// labels `Billing::Invoice`, and both declaration styles converge on one
+    /// label (#2302). Distinct from `namespace_stack`, which C# uses for ids and
+    /// node metadata and Ruby never touches.
+    pub scope_segments: Vec<String>,
+
+    /// `<lang>_var_types`: per-CALLER `var -> ClassName`, where the other
+    /// languages' tables are per-method-body or per-file. Ruby alone.
+    pub caller_var_types: HashMap<String, HashMap<String, Option<String>>>,
+
+    /// raw_calls collected during the DECLARATION walk, appended after the call
+    /// pass so they land at the END of the list. Ruby's `include`/`extend`
+    /// mixins alone -- they are found in a class body, before `raw_calls` exists.
+    pub deferred_raw_calls: Vec<RawCall>,
 
     /// `type_table`: the per-file `var -> ClassName` map the cross-file
     /// member-call pass uses to type a receiver. Populated by `before_calls` and
@@ -859,6 +891,9 @@ fn extract<'py>(
         label_to_nid_ci: HashMap::new(),
         seen_rel_triples: HashSet::new(),
         pending_listen_edges: Vec::new(),
+        scope_segments: Vec::new(),
+        caller_var_types: HashMap::new(),
+        deferred_raw_calls: Vec::new(),
         type_table: HashMap::new(),
         path_resolver,
     };
@@ -917,6 +952,10 @@ fn extract<'py>(
         calls::walk_calls(&mut ctx, body, &caller_nid, table)?;
     }
     cfg.hooks.after_calls(&mut ctx)?;
+    // Appended AFTER every raw_call the call pass produced, matching the
+    // Python's `raw_calls.extend(_ruby_mixin_calls)` at the very end.
+    let deferred = std::mem::take(&mut ctx.deferred_raw_calls);
+    ctx.raw_calls.extend(deferred);
 
     // ── Clean edges ─────────────────────────────────────────────────────────
     let mut clean: Vec<&EdgeRow> = Vec::with_capacity(ctx.edges.len());
@@ -987,6 +1026,7 @@ pub fn engine_configs() -> Vec<&'static EngineConfig> {
         &crate::c::CONFIG,
         &crate::cpp::CONFIG,
         &crate::php::CONFIG,
+        &crate::ruby::CONFIG,
     ]
 }
 

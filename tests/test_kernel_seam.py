@@ -372,7 +372,7 @@ def test_one_language_config_per_routed_grammar():
             assert cfg.name_fallback_child_types == (), names[0]
             assert cfg.body_fallback_child_types == (), names[0]
             assert cfg.resolve_function_name_fn is None, names[0]
-        assert cfg.sanitize_symbol_name_fn is None, names[0]
+            assert cfg.sanitize_symbol_name_fn is None, names[0]
         assert dataclasses.is_dataclass(cfg)
 
 
@@ -428,7 +428,7 @@ def test_engine_configs_match_their_language_config():
     # Not a value comparison: the engine reports whether it has a resolver, and
     # the two must AGREE about that, because `None` selects a different branch of
     # the function-name lookup rather than meaning "do nothing".
-    PRESENCE_FIELDS = ("resolve_function_name",)
+    PRESENCE_FIELDS = ("resolve_function_name", "sanitize_symbol_name")
 
     engine = kernel_mod.engine_configs()
     assert engine, "the engine reported no languages"

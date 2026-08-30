@@ -69,6 +69,8 @@ pub type Walker = for<'py> fn(
 /// tokio    rust           793  100.0%      0.0%          0
 /// bun      rust          1527   87.9%     12.1%          0
 /// serde    rust           208  100.0%      0.0%          0
+/// rails    ruby          3458  100.0%      0.0%          0
+/// sinatra  ruby           147  100.0%      0.0%          0
 /// redis    c              756   56.2%     43.8%          0
 /// curl     c             1014   73.7%     26.3%          0
 /// ```
@@ -141,7 +143,7 @@ pub type Walker = for<'py> fn(
 pub fn supported() -> Vec<&'static str> {
     vec![
         "typescript", "tsx", "javascript", "python", "java", "csharp", "c", "cpp",
-        "php", "bash", "go", "rust",
+        "php", "bash", "go", "rust", "ruby",
     ]
 }
 
@@ -159,6 +161,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
         "bash" => Some(crate::bash::walk_bash),
         "go" => Some(crate::go::walk_go),
         "rust" => Some(crate::rust::walk_rust),
+        "ruby" => Some(crate::ruby::walk_ruby),
         _ => None,
     }
 }
@@ -184,7 +187,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
 /// The node-kind and field counts change with essentially any grammar revision,
 /// which is what makes the triple a usable proxy for "same grammar".
 pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
-    let langs: [(&'static str, tree_sitter::Language); 12] = [
+    let langs: [(&'static str, tree_sitter::Language); 13] = [
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ("javascript", tree_sitter_javascript::LANGUAGE.into()),
@@ -197,6 +200,7 @@ pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
         ("bash", tree_sitter_bash::LANGUAGE.into()),
         ("go", tree_sitter_go::LANGUAGE.into()),
         ("rust", tree_sitter_rust::LANGUAGE.into()),
+        ("ruby", tree_sitter_ruby::LANGUAGE.into()),
     ];
     langs
         .iter()

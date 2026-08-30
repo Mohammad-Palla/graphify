@@ -55,7 +55,10 @@ pub fn walk<'tree>(
             Some(n) => n,
             None => return Ok(()),
         };
-        let class_name = ctx.text(name_node)?.to_string();
+        let raw_class_name = ctx.text(name_node)?.to_string();
+        // Ruby qualifies the label against the enclosing module/class and pushes
+        // the segments for the body walk; every other language is identity.
+        let (class_name, pushed_segments) = hooks.qualify_class_name(ctx, &raw_class_name)?;
         // `_make_id(stem, ".".join(namespace_stack), class_name)`. Outside C# the
         // middle part is "" and `make_id` drops it.
         let class_nid = ctx.mkid(&[&ctx.stem.clone(), &ctx.ns(), &class_name])?;
@@ -79,9 +82,20 @@ pub fn walk<'tree>(
         hooks.on_class(ctx, node, &class_nid, &class_name, line)?;
 
         if let Some(body) = find_body(ctx, node) {
+            let n = pushed_segments.len();
+            ctx.scope_segments.extend(pushed_segments);
+            let mut result = Ok(());
             for child in children(body) {
-                walk(ctx, child, Some(&class_nid))?;
+                result = walk(ctx, child, Some(&class_nid));
+                if result.is_err() {
+                    break;
+                }
             }
+            // The Python pops in a `finally`, so the segments come off even when
+            // the recursion raises.
+            let keep = ctx.scope_segments.len() - n;
+            ctx.scope_segments.truncate(keep);
+            result?;
         }
         return Ok(());
     }
@@ -118,9 +132,15 @@ pub fn walk<'tree>(
             Some(n) if !n.is_empty() => n,
             _ => return Ok(()),
         };
-        // `sanitize_symbol_name_fn` is unset for every language on this engine
-        // so far; when one needs it, it becomes a hook and this comment goes.
-        if !ctx.normalizes_to_something(&func_name)? {
+        // `sanitize_symbol_name_fn`: the ID uses the sanitized name, the LABEL
+        // keeps the raw one, and the empties-out check runs on the SANITIZED
+        // name -- Ruby's `!` / `?` / `=` suffixes would otherwise normalize away
+        // and take the method with them.
+        let sanitized = match ctx.cfg.sanitize_symbol_name {
+            Some(f) => f(&func_name),
+            None => func_name.clone(),
+        };
+        if !ctx.normalizes_to_something(&sanitized)? {
             return Ok(());
         }
 
@@ -128,7 +148,7 @@ pub fn walk<'tree>(
         let parens = ctx.cfg.function_label_parens;
         let func_nid = match parent_class_nid {
             Some(p) => {
-                let nid = ctx.mkid(&[p, &func_name])?;
+                let nid = ctx.mkid(&[p, &sanitized])?;
                 let label = if parens {
                     format!(".{func_name}()")
                 } else {
@@ -139,7 +159,7 @@ pub fn walk<'tree>(
                 nid
             }
             None => {
-                let nid = ctx.mkid(&[&ctx.stem.clone(), &func_name])?;
+                let nid = ctx.mkid(&[&ctx.stem.clone(), &sanitized])?;
                 let label = if parens {
                     format!("{func_name}()")
                 } else {

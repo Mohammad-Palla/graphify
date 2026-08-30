@@ -493,6 +493,7 @@ pub static CONFIG: EngineConfig = EngineConfig {
     call_accessor_object_field: "",
     function_label_parens: true,
     resolve_function_name: None,
+    sanitize_symbol_name: None,
     type_table_key: None,
     hooks: &HOOKS,
 };
