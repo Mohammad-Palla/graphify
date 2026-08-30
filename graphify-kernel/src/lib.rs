@@ -35,6 +35,7 @@ mod bash;
 mod c;
 mod cpp;
 mod csharp;
+mod go;
 mod php;
 mod java;
 mod js;

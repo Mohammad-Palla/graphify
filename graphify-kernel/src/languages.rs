@@ -62,6 +62,9 @@ pub type Walker = for<'py> fn(
 /// guzzle   php            137  100.0%      0.0%          0
 /// bats     bash           281   96.8%      3.2%          0
 /// (6 more) bash           134   72.4%     27.6%          0
+/// k8s      go           17865   99.3%      0.7%          0
+/// prometheus go           730  100.0%      0.0%          0
+/// gin      go              99  100.0%      0.0%          0
 /// redis    c              756   56.2%     43.8%          0
 /// curl     c             1014   73.7%     26.3%          0
 /// ```
@@ -95,6 +98,10 @@ pub type Walker = for<'py> fn(
 /// (bats) down to 34.5% (efcore, whose shell scripts are almost all
 /// source-and-dispatch wrappers). 368 of 415 files over seven corpora.
 ///
+/// Go is the best result here by volume: 99.3% over 18,694 files. It is the
+/// second bespoke walker and, unlike Bash, touches no filesystem at all, so
+/// there is no scope deferral -- every file the grammar parses is handled.
+///
 /// C#'s deferral rate is an order of magnitude above every other language's and
 /// it is NOT a gap in the walker: 8.2% of those 7,177 files make
 /// `tree-sitter-c-sharp` 0.23.5 produce an ERROR node, and Python's recovery is
@@ -124,7 +131,7 @@ pub type Walker = for<'py> fn(
 pub fn supported() -> Vec<&'static str> {
     vec![
         "typescript", "tsx", "javascript", "python", "java", "csharp", "c", "cpp",
-        "php", "bash",
+        "php", "bash", "go",
     ]
 }
 
@@ -140,6 +147,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
         "cpp" => Some(crate::cpp::walk_cpp),
         "php" => Some(crate::php::walk_php),
         "bash" => Some(crate::bash::walk_bash),
+        "go" => Some(crate::go::walk_go),
         _ => None,
     }
 }
@@ -165,7 +173,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
 /// The node-kind and field counts change with essentially any grammar revision,
 /// which is what makes the triple a usable proxy for "same grammar".
 pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
-    let langs: [(&'static str, tree_sitter::Language); 10] = [
+    let langs: [(&'static str, tree_sitter::Language); 11] = [
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ("javascript", tree_sitter_javascript::LANGUAGE.into()),
@@ -176,6 +184,7 @@ pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
         ("cpp", tree_sitter_cpp::LANGUAGE.into()),
         ("php", tree_sitter_php::LANGUAGE_PHP.into()),
         ("bash", tree_sitter_bash::LANGUAGE.into()),
+        ("go", tree_sitter_go::LANGUAGE.into()),
     ];
     langs
         .iter()

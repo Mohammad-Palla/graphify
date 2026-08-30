@@ -165,3 +165,31 @@ mod tests {
         }
     }
 }
+
+/// `Path(path).parent.name` -- the immediate parent DIRECTORY's name, or `""`
+/// for a top-level file.
+///
+/// Go uses it as the package scope, so methods on one type across several files
+/// of a package share a canonical type node. It carries the same backslash
+/// caveat as `file_stem` and defers for the same reason.
+pub fn parent_name(path: &str) -> Option<String> {
+    if path.contains('\\') {
+        return None;
+    }
+    if path.is_empty() || path.ends_with('/') || path.contains("//") {
+        return None;
+    }
+    if path.split('/').any(|c| c == "." || c == "..") {
+        return None;
+    }
+    let dir = match path.rfind('/') {
+        // `Path("a/b.go").parent` is `a`; `Path("/b.go").parent` is `/`, whose
+        // `.name` is "" -- the leading-slash case falls out of the empty slice.
+        Some(i) => &path[..i],
+        None => "",
+    };
+    Some(match dir.rfind('/') {
+        Some(i) => dir[i + 1..].to_string(),
+        None => dir.to_string(),
+    })
+}

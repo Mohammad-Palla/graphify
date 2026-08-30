@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from graphify.extractors import kernel as _kernel
 from graphify.extractors.base import _LANGUAGE_BUILTIN_GLOBALS, _file_stem, _make_id, _read_text
 
 
@@ -82,8 +83,14 @@ def _go_collect_type_refs(node, source: bytes, generic: bool, out: list[tuple[st
             if c.is_named:
                 _go_collect_type_refs(c, source, generic, out)
 
+_KERNEL_GRAMMAR = _kernel.BespokeGrammar("tree_sitter_go")
+
+
 def extract_go(path: Path) -> dict:
     """Extract functions, methods, type declarations, and imports from a .go file."""
+    native = _kernel.try_extract(path, _KERNEL_GRAMMAR)
+    if native is not None:
+        return native
     try:
         import tree_sitter_go as tsgo
         from tree_sitter import Language, Parser
