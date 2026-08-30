@@ -238,6 +238,34 @@ pub trait LangHooks {
         Ok(())
     }
 
+    /// Immediately after a function's body is pushed to `function_bodies`.
+    ///
+    /// Kotlin alone: `object : Foo { ... }` anonymous objects live inside a
+    /// function body, which the function branch never recurses into, so their
+    /// members and every call inside them got no nodes at all (#2347).
+    fn on_function_body<'tree>(
+        &self,
+        _ctx: &mut Ctx<'_, 'tree>,
+        _node: Node<'tree>,
+        _func_nid: &str,
+        _body: Node<'tree>,
+    ) -> R<()> {
+        Ok(())
+    }
+
+    /// Extra top-level keys on the result dict, after nodes/edges/raw_calls.
+    ///
+    /// Kotlin's declared `package` qualifies every node in the file, and the
+    /// import-target and qualified-call resolvers key their per-package symbol
+    /// indexes off it (#2526/#2550).
+    fn result_extra<'tree>(
+        &self,
+        _ctx: &Ctx<'_, 'tree>,
+        _root: Node<'tree>,
+    ) -> R<Vec<(&'static str, Val)>> {
+        Ok(Vec::new())
+    }
+
     /// The trailing `_<lang>_extra_walk` slot, before the default recurse.
     fn extra_walk<'tree>(
         &self,
@@ -478,6 +506,13 @@ pub struct Ctx<'a, 'tree> {
     /// label (#2302). Distinct from `namespace_stack`, which C# uses for ids and
     /// node metadata and Ruby never touches.
     pub scope_segments: Vec<String>,
+
+    /// Property / field INITIALIZERS, walked by the call pass after every
+    /// function body. `val repo = createRepo()` is a call that lives in no
+    /// function, so without this it produced no edge (#1356/#2565). Keyed by the
+    /// node that OWNS the initializer -- the enclosing class, or the file for a
+    /// top-level property.
+    pub initializer_nodes: Vec<(String, Node<'tree>)>,
 
     /// `<lang>_var_types`: per-CALLER `var -> ClassName`, where the other
     /// languages' tables are per-method-body or per-file. Ruby alone.
@@ -892,6 +927,7 @@ fn extract<'py>(
         seen_rel_triples: HashSet::new(),
         pending_listen_edges: Vec::new(),
         scope_segments: Vec::new(),
+        initializer_nodes: Vec::new(),
         caller_var_types: HashMap::new(),
         deferred_raw_calls: Vec::new(),
         type_table: HashMap::new(),
@@ -951,6 +987,15 @@ fn extract<'py>(
         let table = tables.get(&key).unwrap_or(&no_table);
         calls::walk_calls(&mut ctx, body, &caller_nid, table)?;
     }
+    // #1356/#2565: property initializers, AFTER every function body.
+    // `walk_calls` self-guards against re-entering a function body and dedups
+    // through `seen_call_pairs`, so a closure inside an initializer is not
+    // double-walked.
+    let inits: Vec<(String, Node)> = ctx.initializer_nodes.clone();
+    for (owner_nid, init_node) in inits {
+        calls::walk_calls(&mut ctx, init_node, &owner_nid, &no_table)?;
+    }
+
     cfg.hooks.after_calls(&mut ctx)?;
     // Appended AFTER every raw_call the call pass produced, matching the
     // Python's `raw_calls.extend(_ruby_mixin_calls)` at the very end.
@@ -991,6 +1036,12 @@ fn extract<'py>(
     out.set_item("nodes", nodes).map_err(|_| "py_error")?;
     out.set_item("edges", edges).map_err(|_| "py_error")?;
     out.set_item("raw_calls", raw_calls).map_err(|_| "py_error")?;
+    for (k, v) in cfg.hooks.result_extra(&ctx, root)? {
+        let d = PyDict::new(py);
+        v.set_on(&d, k).map_err(|_| "py_error")?;
+        let item = d.get_item(k).map_err(|_| "py_error")?.ok_or("py_error")?;
+        out.set_item(k, item).map_err(|_| "py_error")?;
+    }
     // `elif type_table:` -- absent, not empty, when nothing was recorded.
     if let Some(key) = cfg.type_table_key {
         if !ctx.type_table.is_empty() {
@@ -1027,6 +1078,7 @@ pub fn engine_configs() -> Vec<&'static EngineConfig> {
         &crate::cpp::CONFIG,
         &crate::php::CONFIG,
         &crate::ruby::CONFIG,
+        &crate::kotlin::CONFIG,
     ]
 }
 

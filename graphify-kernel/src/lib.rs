@@ -40,6 +40,7 @@ mod php;
 mod ruby;
 mod rust;
 mod java;
+mod kotlin;
 mod js;
 mod languages;
 mod py;

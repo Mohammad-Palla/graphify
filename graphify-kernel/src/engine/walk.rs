@@ -181,6 +181,7 @@ pub fn walk<'tree>(
                     .insert((body.start_byte(), body.end_byte()), (node, p.to_string()));
             }
             ctx.function_bodies.push((func_nid.clone(), body));
+            hooks.on_function_body(ctx, node, &func_nid, body)?;
         }
         return Ok(());
     }

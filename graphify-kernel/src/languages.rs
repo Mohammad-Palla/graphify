@@ -71,6 +71,9 @@ pub type Walker = for<'py> fn(
 /// serde    rust           208  100.0%      0.0%          0
 /// rails    ruby          3458  100.0%      0.0%          0
 /// sinatra  ruby           147  100.0%      0.0%          0
+/// ktor     kotlin        2527   97.1%      2.9%          0
+/// coroutines kotlin      1082   98.2%      1.8%          0
+/// okhttp   kotlin         617   98.9%      1.1%          0
 /// redis    c              756   56.2%     43.8%          0
 /// curl     c             1014   73.7%     26.3%          0
 /// ```
@@ -143,7 +146,7 @@ pub type Walker = for<'py> fn(
 pub fn supported() -> Vec<&'static str> {
     vec![
         "typescript", "tsx", "javascript", "python", "java", "csharp", "c", "cpp",
-        "php", "bash", "go", "rust", "ruby",
+        "php", "bash", "go", "rust", "ruby", "kotlin",
     ]
 }
 
@@ -162,6 +165,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
         "go" => Some(crate::go::walk_go),
         "rust" => Some(crate::rust::walk_rust),
         "ruby" => Some(crate::ruby::walk_ruby),
+        "kotlin" => Some(crate::kotlin::walk_kotlin),
         _ => None,
     }
 }
@@ -187,7 +191,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
 /// The node-kind and field counts change with essentially any grammar revision,
 /// which is what makes the triple a usable proxy for "same grammar".
 pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
-    let langs: [(&'static str, tree_sitter::Language); 13] = [
+    let langs: [(&'static str, tree_sitter::Language); 14] = [
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ("javascript", tree_sitter_javascript::LANGUAGE.into()),
@@ -201,6 +205,7 @@ pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
         ("go", tree_sitter_go::LANGUAGE.into()),
         ("rust", tree_sitter_rust::LANGUAGE.into()),
         ("ruby", tree_sitter_ruby::LANGUAGE.into()),
+        ("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into()),
     ];
     langs
         .iter()

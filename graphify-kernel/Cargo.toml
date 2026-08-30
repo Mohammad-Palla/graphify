@@ -31,6 +31,7 @@ tree-sitter-bash = "0.25.1"
 tree-sitter-go = "0.25.0"
 tree-sitter-rust = "0.24.2"
 tree-sitter-ruby = "0.23.1"
+tree-sitter-kotlin-ng = "1.1.0"
 # `_csharp_namespace_id` is `sha1(dotted_name).hexdigest()[:16]`, so the digest
 # is part of the node id and has to be the real thing.
 sha1 = "0.10"

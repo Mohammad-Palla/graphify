@@ -72,6 +72,12 @@ impl Val {
     fn set(&self, d: &Bound<'_, PyDict>, key: &str) -> PyResult<()> {
         d.set_item(key, self.to_py(d.py())?)
     }
+
+    /// The same, public: `engine::extract` writes `result_extra` values into the
+    /// result dict without going through a `NodeRow` or an `EdgeRow`.
+    pub fn set_on(&self, d: &Bound<'_, PyDict>, key: &str) -> PyResult<()> {
+        self.set(d, key)
+    }
 }
 
 pub struct NodeRow {
