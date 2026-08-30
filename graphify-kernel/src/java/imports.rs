@@ -7,7 +7,7 @@
 
 use tree_sitter::Node;
 
-use super::{Ctx, R};
+use crate::engine::{Ctx, R};
 use crate::js::ast::children;
 
 /// `_walk_scoped`: the dotted name under a `scoped_identifier` chain.

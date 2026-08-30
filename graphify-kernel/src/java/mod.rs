@@ -1,243 +1,426 @@
-//! The Java native walker.
+//! Java on the shared engine: a [`EngineConfig`] plus the nine hook slots.
 //!
-//! A transliteration of the Java-live slice of `engine.py::_extract_generic` --
-//! the branches reachable when `config` is `_JAVA_CONFIG` -- plus the `_java_*`
-//! helpers they call. Same two rules as the JS and Python walkers:
+//! Everything structural -- the class branch, the function branch, name and
+//! body resolution, the call branch, the raw_call shape -- lives in
+//! `engine::walk` / `engine::calls` and is shared. What is here is exactly what
+//! the Python guards on `_is_java`, and nothing else.
 //!
-//! 1. **Recurse by default, defer on a guard.**
-//! 2. **Defer with a reason, never guess.**
+//! `_JAVA_CONFIG` leaves `static_prop_types`, `helper_fn_names`,
+//! `container_bind_methods`, `event_listener_properties`, both fallback tuples
+//! and `call_accessor_node_types` empty, and sets no `resolve_function_name_fn`
+//! or `sanitize_symbol_name_fn`. Those appear below as empty slices / absent
+//! hooks rather than as dead code.
 //!
-//! # What `_JAVA_CONFIG` switches off
-//!
-//! `static_prop_types`, `helper_fn_names`, `container_bind_methods`,
-//! `event_listener_properties`, `name_fallback_child_types`,
-//! `body_fallback_child_types` and `call_accessor_node_types` are all EMPTY, and
-//! `resolve_function_name_fn`, `sanitize_symbol_name_fn` and `extra_walk_fn` are
-//! all `None`. Those branches are therefore absent below rather than ported as
-//! dead code -- if a future config gives Java any of them, this walker must be
-//! updated, which is why they are named here.
-//!
-//! `extra_walk_fn` being `None` does not mean Java has no extra walk:
-//! `_java_extra_walk` is called from `walk` directly, behind an `_is_java`
-//! guard, not through the config. It handles `enum_constant`.
-//!
-//! `namespace_stack` and `scope_stack` are only ever pushed by the C# namespace
-//! handler, so for Java they are permanently empty -- which is why `add_node`
-//! here never emits `metadata`, `type` or `scope_chain`.
-//!
-//! # No import resolver
-//!
-//! Unlike JS and Python, `_import_java` touches no filesystem: a Java import
-//! names a package and the handler keeps only its last dotted segment. So there
-//! is no callback into Python here and no I/O to defer on.
+//! `_java_extra_walk` is NOT wired through `config.extra_walk_fn` (which is
+//! None) -- the Python calls it from `walk` behind an `_is_java` guard. Here it
+//! is the `extra_walk` hook, which is the same position.
 
 use std::collections::{HashMap, HashSet};
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
-use crate::ids::{file_stem, make_id_ascii, normalize_id_ascii};
-use crate::js::ast::{children, text_checked};
-use crate::js::emit::{self, EdgeRow, NodeRow, RawCall, Val};
+use crate::engine::{CallInfo, Ctx, EngineConfig, Handled, LangHooks, R};
+use crate::js::ast::children;
+use crate::js::emit::Val;
 use crate::Outcome;
 
 pub mod calls;
 pub mod consts;
 pub mod helpers;
 pub mod imports;
-pub mod walk;
 
-/// See `js::MAX_DEPTH`. Same reasoning, same bound.
-const MAX_DEPTH: u32 = 1000;
+use helpers::Role;
 
-pub type R<T> = Result<T, &'static str>;
+struct Java;
 
-fn tree_depth(root: Node) -> u32 {
-    let mut stack = vec![(root, 1u32)];
-    let mut max = 1u32;
-    while let Some((n, d)) = stack.pop() {
-        if d > max {
-            max = d;
-            if max > MAX_DEPTH {
-                return max;
+/// `_emit_java_parent`: resolve a base type to a node, minting a SOURCELESS stub
+/// when it is not already known, then link it.
+///
+/// NOT `ensure_named_node`: the stub carries no `origin_file` key and the scoped
+/// probe omits the empty namespace part. The two produce the same id string here
+/// but different node SHAPES, so they stay separate emitters.
+fn emit_parent(
+    ctx: &mut Ctx,
+    class_nid: &str,
+    base_name: &str,
+    rel: &'static str,
+    at_line: usize,
+) -> R<()> {
+    if base_name.is_empty() {
+        return Ok(());
+    }
+    let base_nid = ctx.ensure_parent_node(base_name)?;
+    ctx.add_edge(class_nid, &base_nid, rel, at_line);
+    Ok(())
+}
+
+/// `_emit_java_parent_type`: the FIRST `type` role becomes the parent link,
+/// every `generic_arg` becomes a `references` edge.
+fn emit_parent_type(
+    ctx: &mut Ctx,
+    class_nid: &str,
+    type_node: Option<Node>,
+    rel: &'static str,
+    at_line: usize,
+) -> R<()> {
+    let mut refs = Vec::new();
+    helpers::collect_type_refs(ctx, type_node, false, &mut refs, None, false)?;
+    let refs: Vec<(String, Role)> = refs.into_iter().map(|(n, r)| (n.to_string(), r)).collect();
+    let mut parent_emitted = false;
+    for (ref_name, role) in refs {
+        if role == Role::Type && !parent_emitted {
+            emit_parent(ctx, class_nid, &ref_name, rel, at_line)?;
+            parent_emitted = true;
+        } else if role == Role::GenericArg {
+            let target = ctx.ensure_named_node(&ref_name, at_line)?;
+            if target != class_nid {
+                ctx.add_edge_ctx(class_nid, &target, "references", at_line, "generic_arg");
             }
         }
-        for c in children(n) {
-            stack.push((c, d + 1));
-        }
     }
-    max
+    Ok(())
 }
 
-/// Everything `_extract_generic` keeps in its local scope for one Java file.
-pub struct Ctx<'a, 'tree> {
-    pub src: &'a [u8],
-    pub str_path: &'a str,
-    pub stem: String,
-    pub file_nid: String,
-
-    pub nodes: Vec<NodeRow>,
-    pub seen_ids: HashSet<String>,
-    pub edges: Vec<EdgeRow>,
-    pub raw_calls: Vec<RawCall>,
-
-    pub callable_def_nids: HashSet<String>,
-    pub callable_class_nids: HashSet<String>,
-    pub function_bodies: Vec<(String, Node<'tree>)>,
-
-    /// `java_field_types`: {class_nid: {field_name: declared_type}}. Built by the
-    /// declaration walk, read by the call pass for receiver resolution.
-    pub java_field_types: HashMap<String, HashMap<String, String>>,
-    /// `java_method_scopes`, keyed by the body node's id in Python. Keyed here by
-    /// the body's byte range, which is unique within one tree and, unlike a
-    /// pointer, is stable across the clone in the call pass.
-    pub java_method_scopes: HashMap<(usize, usize), (Node<'tree>, String)>,
-
-    pub label_to_nid: HashMap<String, String>,
-    pub nid_to_sf: HashMap<String, String>,
-    pub seen_call_pairs: HashSet<(String, String)>,
-    pub seen_indirect_pairs: HashSet<(String, String)>,
+/// `references` edges for every type in `type_node`, mapping the `type` role to
+/// `type_ctx` and `generic_arg` to `"generic_arg"`. Shared by the field,
+/// parameter, return-type and record-component blocks, which differ only in that
+/// one context string.
+fn emit_type_refs(
+    ctx: &mut Ctx,
+    owner_nid: &str,
+    type_node: Option<Node>,
+    type_ctx: &'static str,
+    line: usize,
+    preserve_qualified: bool,
+) -> R<()> {
+    let mut refs = Vec::new();
+    helpers::collect_type_refs(ctx, type_node, false, &mut refs, None, preserve_qualified)?;
+    let refs: Vec<(String, Role)> = refs.into_iter().map(|(n, r)| (n.to_string(), r)).collect();
+    for (ref_name, role) in refs {
+        let c = if role == Role::GenericArg { "generic_arg" } else { type_ctx };
+        let target = ctx.ensure_named_node(&ref_name, line)?;
+        if target != owner_nid {
+            ctx.add_edge_ctx(owner_nid, &target, "references", line, c);
+        }
+    }
+    Ok(())
 }
 
-impl<'a, 'tree> Ctx<'a, 'tree> {
-    pub fn mkid(&self, parts: &[&str]) -> R<String> {
-        make_id_ascii(parts).ok_or("non_ascii_id")
-    }
-
-    pub fn text(&self, node: Node) -> R<&'a str> {
-        text_checked(node, self.src).ok_or("invalid_utf8_text")
-    }
-
-    /// `add_node`. For Java `metadata`, `type` and `scope_chain` are never set
-    /// (see the module docstring), so the dict is always these five keys.
-    pub fn add_node(&mut self, nid: &str, label: &str, line: usize) {
-        if !self.seen_ids.insert(nid.to_string()) {
-            return;
+/// The annotation block, shared by the class and function hooks.
+///
+/// The two differ in ONE way in the Python and it is cosmetic: at class level
+/// the dotted-name substitution reads `if "." in anno_raw and _is_java:
+/// anno_name = anno_raw`, at function level `anno_raw if "." in anno_raw else
+/// anno_name`. Both reduce to the same choice for Java, so one helper serves
+/// both -- stated because the asymmetry invites "fixing" one to match the other.
+fn emit_annotations(ctx: &mut Ctx, owner_nid: &str, decl: Node, line: usize) -> R<()> {
+    let mut targets: HashSet<String> = HashSet::new();
+    let names: Vec<(String, String)> = helpers::annotation_names(ctx, decl)?
+        .into_iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+    for (anno_name, anno_raw) in names {
+        let chosen = if anno_raw.contains('.') { &anno_raw } else { &anno_name };
+        let target = ctx.ensure_named_node(chosen, line)?;
+        if target != owner_nid && targets.insert(target.clone()) {
+            ctx.add_edge_ctx(owner_nid, &target, "references", line, "attribute");
         }
-        self.nodes.push(NodeRow {
-            id: nid.to_string(),
-            fields: vec![
-                ("label", Val::S(label.to_string())),
-                ("file_type", Val::Static("code")),
-                ("source_file", Val::S(self.str_path.to_string())),
-                ("source_location", Val::S(format!("L{line}"))),
-            ],
-        });
+    }
+    let lits: Vec<String> = helpers::annotation_class_literal_refs(ctx, decl)?
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+    for ref_name in lits {
+        let target = ctx.ensure_named_node(&ref_name, line)?;
+        if target != owner_nid && targets.insert(target.clone()) {
+            ctx.add_edge_ctx(owner_nid, &target, "references", line, "attribute");
+        }
+    }
+    Ok(())
+}
+
+impl LangHooks for Java {
+    fn import_handler<'tree>(&self, ctx: &mut Ctx<'_, 'tree>, node: Node<'tree>) -> R<()> {
+        imports::import_java(ctx, node)
     }
 
-    /// `add_edge` with its default confidence/weight, `context` absent.
-    pub fn add_edge(&mut self, src: &str, tgt: &str, relation: &'static str, line: usize) {
-        self.edges.push(EdgeRow {
-            source: src.to_string(),
-            target: tgt.to_string(),
-            relation,
-            fields: vec![
-                ("confidence", Val::Static("EXTRACTED")),
-                ("source_file", Val::S(self.str_path.to_string())),
-                ("source_location", Val::S(format!("L{line}"))),
-                ("weight", Val::F(1.0)),
-            ],
-        });
-    }
-
-    /// `add_edge(..., context=...)`: same shape, `context` last.
-    pub fn add_edge_ctx(
-        &mut self,
-        src: &str,
-        tgt: &str,
-        relation: &'static str,
+    fn on_class<'tree>(
+        &self,
+        ctx: &mut Ctx<'_, 'tree>,
+        node: Node<'tree>,
+        class_nid: &str,
+        _class_name: &str,
         line: usize,
-        context: &'static str,
-    ) {
-        self.edges.push(EdgeRow {
-            source: src.to_string(),
-            target: tgt.to_string(),
-            relation,
-            fields: vec![
-                ("confidence", Val::Static("EXTRACTED")),
-                ("source_file", Val::S(self.str_path.to_string())),
-                ("source_location", Val::S(format!("L{line}"))),
-                ("weight", Val::F(1.0)),
-                ("context", Val::Static(context)),
-            ],
-        });
+    ) -> R<()> {
+        // extends
+        if let Some(sup) = node.child_by_field_name("superclass") {
+            if let Some(sub) = children(sup).into_iter().find(|c| c.is_named()) {
+                emit_parent_type(ctx, class_nid, Some(sub), "inherits", line)?;
+            }
+        }
+        // implements
+        if let Some(ifs) = node.child_by_field_name("interfaces") {
+            for sub in children(ifs) {
+                if sub.kind() != "type_list" {
+                    continue;
+                }
+                for tid in children(sub) {
+                    if tid.is_named() {
+                        emit_parent_type(ctx, class_nid, Some(tid), "implements", line)?;
+                    }
+                }
+            }
+        }
+        // interface extends
+        if node.kind() == "interface_declaration" {
+            for child in children(node) {
+                if child.kind() != "extends_interfaces" {
+                    continue;
+                }
+                for sub in children(child) {
+                    if sub.kind() != "type_list" {
+                        continue;
+                    }
+                    for tid in children(sub) {
+                        if tid.is_named() {
+                            emit_parent_type(ctx, class_nid, Some(tid), "inherits", line)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        emit_annotations(ctx, class_nid, node, line)?;
+
+        // record components: the reference line is the COMPONENT's, not the
+        // record's.
+        if node.kind() == "record_declaration" {
+            if let Some(components) = node.child_by_field_name("parameters") {
+                for component in children(components) {
+                    let type_node = match component.kind() {
+                        "formal_parameter" => component.child_by_field_name("type"),
+                        "spread_parameter" => children(component).into_iter().find(|c| {
+                            c.is_named() && !matches!(c.kind(), "modifiers" | "variable_declarator")
+                        }),
+                        _ => continue,
+                    };
+                    let component_line = component.start_position().row + 1;
+                    emit_type_refs(ctx, class_nid, type_node, "field", component_line, false)?;
+                }
+            }
+        }
+        Ok(())
     }
 
-    /// The import edge `_import_java` appends directly. It carries `context`
-    /// THIRD -- right after `relation` -- which is a different key order from
-    /// `add_edge`, so it is built here rather than reusing one.
-    pub fn add_import_edge(&mut self, tgt: &str, line: usize) {
-        let src = self.file_nid.clone();
-        self.edges.push(EdgeRow {
-            source: src,
-            target: tgt.to_string(),
-            relation: "imports",
-            fields: vec![
-                ("context", Val::Static("import")),
-                ("confidence", Val::Static("EXTRACTED")),
-                ("source_file", Val::S(self.str_path.to_string())),
-                ("source_location", Val::S(format!("L{line}"))),
-                ("weight", Val::F(1.0)),
-            ],
-        });
+    fn before_function<'tree>(
+        &self,
+        ctx: &mut Ctx<'_, 'tree>,
+        node: Node<'tree>,
+        parent_class_nid: Option<&str>,
+    ) -> R<Handled> {
+        let parent = match parent_class_nid {
+            Some(p) => p.to_string(),
+            None => return Ok(Handled::No),
+        };
+        match node.kind() {
+            "field_declaration" => {
+                let type_node = match node.child_by_field_name("type") {
+                    Some(t) => t,
+                    // Python returns from INSIDE `if type_node is not None`, so a
+                    // field with no type field falls through to the branches below.
+                    None => return Ok(Handled::No),
+                };
+                if let Some(receiver_type) = helpers::receiver_type_name(ctx, Some(type_node))? {
+                    let receiver_type = receiver_type.to_string();
+                    let names: Vec<String> = helpers::declarator_names(ctx, node)?
+                        .into_iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    let fields = ctx.field_types.entry(parent.clone()).or_default();
+                    for field_name in names {
+                        fields.insert(field_name, receiver_type.clone());
+                    }
+                }
+                let line = node.start_position().row + 1;
+                emit_type_refs(ctx, &parent, Some(type_node), "field", line, false)?;
+                Ok(Handled::Yes)
+            }
+            "annotation_type_element_declaration" => {
+                let line = node.start_position().row + 1;
+                // `preserve_qualified=True` here and nowhere else in the Java path.
+                emit_type_refs(
+                    ctx,
+                    &parent,
+                    node.child_by_field_name("type"),
+                    "return_type",
+                    line,
+                    true,
+                )?;
+                Ok(Handled::Yes)
+            }
+            _ => Ok(Handled::No),
+        }
     }
 
-    /// `ensure_named_node`. Emits a SOURCELESS stub when the name is not defined
-    /// in this file, so the corpus-level rewire can collapse it onto the real
-    /// definition (#1402).
-    ///
-    /// `namespace_stack` is always empty for Java, so the first id is
-    /// `_make_id(stem, "", name)`.
-    pub fn ensure_named_node(&mut self, name: &str, _line: usize) -> R<String> {
-        let scoped = self.mkid(&[&self.stem.clone(), "", name])?;
-        if self.seen_ids.contains(&scoped) {
-            return Ok(scoped);
+    fn on_function<'tree>(
+        &self,
+        ctx: &mut Ctx<'_, 'tree>,
+        node: Node<'tree>,
+        func_nid: &str,
+        _func_name: &str,
+        line: usize,
+        _parent_class_nid: Option<&str>,
+    ) -> R<()> {
+        if let Some(params_node) = node.child_by_field_name("parameters") {
+            for p in children(params_node) {
+                if p.kind() != "formal_parameter" {
+                    continue;
+                }
+                emit_type_refs(
+                    ctx,
+                    func_nid,
+                    p.child_by_field_name("type"),
+                    "parameter_type",
+                    line,
+                    false,
+                )?;
+            }
         }
-        let bare = self.mkid(&[name])?;
-        if !self.seen_ids.contains(&bare) {
-            self.seen_ids.insert(bare.clone());
-            self.nodes.push(NodeRow {
-                id: bare.clone(),
-                fields: vec![
-                    ("label", Val::S(name.to_string())),
-                    ("file_type", Val::Static("code")),
-                    ("source_file", Val::Static("")),
-                    ("source_location", Val::Static("")),
-                    ("origin_file", Val::S(self.str_path.to_string())),
-                ],
-            });
+        // A `method_declaration`'s `type` field is its RETURN type; a
+        // `constructor_declaration` has no `type` field, so this is a no-op there.
+        if let Some(return_node) = node.child_by_field_name("type") {
+            emit_type_refs(ctx, func_nid, Some(return_node), "return_type", line, false)?;
         }
-        Ok(bare)
+        emit_annotations(ctx, func_nid, node, line)
     }
 
-    /// The bare `_make_id(stem, base) else _make_id(base)` stub the Java parent
-    /// emitter uses. NOT `ensure_named_node`: it emits no `origin_file` key.
-    pub fn ensure_parent_node(&mut self, name: &str) -> R<String> {
-        let scoped = self.mkid(&[&self.stem.clone(), name])?;
-        if self.seen_ids.contains(&scoped) {
-            return Ok(scoped);
+    fn extra_walk<'tree>(
+        &self,
+        ctx: &mut Ctx<'_, 'tree>,
+        node: Node<'tree>,
+        parent_class_nid: Option<&str>,
+    ) -> R<Handled> {
+        // `_java_extra_walk`: enum_constant.
+        if node.kind() != "enum_constant" {
+            return Ok(Handled::No);
         }
-        let bare = self.mkid(&[name])?;
-        if !self.seen_ids.contains(&bare) {
-            self.seen_ids.insert(bare.clone());
-            self.nodes.push(NodeRow {
-                id: bare.clone(),
-                fields: vec![
-                    ("label", Val::S(name.to_string())),
-                    ("file_type", Val::Static("code")),
-                    ("source_file", Val::Static("")),
-                    ("source_location", Val::Static("")),
-                ],
-            });
+        let parent = match parent_class_nid {
+            Some(p) => p.to_string(),
+            None => return Ok(Handled::No),
+        };
+        let name_node = match node.child_by_field_name("name") {
+            Some(n) => n,
+            // Python returns True (handled) even with no name, so the node is
+            // consumed rather than recursed into.
+            None => return Ok(Handled::Yes),
+        };
+        let const_name = ctx.text(name_node)?.to_string();
+        let line = node.start_position().row + 1;
+        let const_nid = ctx.mkid(&[&parent, &const_name])?;
+        ctx.add_node(&const_nid, &const_name, line);
+        ctx.add_edge(&parent, &const_nid, "case_of", line);
+        // Anonymous-body constants (`MONDAY { void greet(){} }`): descend so the
+        // body's methods are not dropped; const_nid attaches them to the constant.
+        for child in children(node) {
+            if child.kind() == "class_body" {
+                for member in children(child) {
+                    crate::engine::walk::walk(ctx, member, Some(&const_nid))?;
+                }
+            }
         }
-        Ok(bare)
+        Ok(Handled::Yes)
     }
 
-    pub fn normalizes_to_something(&self, name: &str) -> R<bool> {
-        Ok(!normalize_id_ascii(name).ok_or("non_ascii_id")?.is_empty())
+    fn call_info<'tree>(&self, ctx: &Ctx<'_, 'tree>, node: Node<'tree>) -> R<Option<CallInfo>> {
+        let mut info = CallInfo::default();
+        if node.kind() == "object_creation_expression" {
+            // #1373: the constructed type is the `type` field, not `name`.
+            if let Some(type_node) = node.child_by_field_name("type") {
+                let raw = ctx.text(type_node)?;
+                let base = raw.split_once('<').map(|(a, _)| a).unwrap_or(raw).trim();
+                let name = base.rsplit_once('.').map(|(_, t)| t).unwrap_or(base);
+                if !name.is_empty() {
+                    info.callee_name = Some(name.to_string());
+                }
+            }
+        } else {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                info.callee_name = Some(ctx.text(name_node)?.to_string());
+            }
+            if let Some(receiver) = node.child_by_field_name("object") {
+                info.is_member_call = true;
+                match receiver.kind() {
+                    "identifier" => info.member_receiver = Some(ctx.text(receiver)?.to_string()),
+                    "this" => info.member_receiver = Some("this".to_string()),
+                    "field_access" => {
+                        let owner = receiver.child_by_field_name("object");
+                        let field = receiver.child_by_field_name("field");
+                        if let (Some(o), Some(f)) = (owner, field) {
+                            if o.kind() == "this" {
+                                info.member_receiver = Some(format!("this.{}", ctx.text(f)?));
+                                info.is_this_field_call = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(Some(info))
+    }
+
+    /// `_java_defer = (_is_java and is_member_call)` -- unconditional, with no
+    /// receiver or capitalization test, unlike Python's and C#'s narrower rules.
+    fn defers(&self, info: &CallInfo) -> bool {
+        info.is_member_call
+    }
+
+    fn raw_call_extra<'tree>(
+        &self,
+        _ctx: &Ctx<'_, 'tree>,
+        info: &CallInfo,
+        receiver_types: &HashMap<String, String>,
+    ) -> Vec<(&'static str, Val)> {
+        let mut out: Vec<(&'static str, Val)> = vec![("lang", Val::Static("java"))];
+        if let Some(rt) = info
+            .member_receiver
+            .as_deref()
+            .and_then(|r| receiver_types.get(r))
+        {
+            out.push(("receiver_type", Val::S(rt.clone())));
+        }
+        out
     }
 }
+
+static HOOKS: Java = Java;
+
+pub static CONFIG: EngineConfig = EngineConfig {
+    language: "java",
+    grammar: || tree_sitter_java::LANGUAGE.into(),
+    class_types: &[
+        "annotation_type_declaration",
+        "class_declaration",
+        "enum_declaration",
+        "interface_declaration",
+        "record_declaration",
+    ],
+    function_types: &["constructor_declaration", "method_declaration"],
+    import_types: &["import_declaration"],
+    call_types: &["method_invocation", "object_creation_expression"],
+    function_boundary_types: &["constructor_declaration", "method_declaration"],
+    name_field: "name",
+    name_fallback_child_types: &[],
+    body_field: "body",
+    body_fallback_child_types: &[],
+    call_function_field: "name",
+    call_accessor_node_types: &[],
+    call_accessor_field: "attribute",
+    call_accessor_object_field: "",
+    function_label_parens: true,
+    hooks: &HOOKS,
+};
 
 pub fn walk_java<'py>(
     py: Python<'py>,
@@ -245,137 +428,5 @@ pub fn walk_java<'py>(
     source: &[u8],
     _res: &crate::Resolvers<'py>,
 ) -> PyResult<Outcome<'py>> {
-    match extract(py, path, source) {
-        Ok(dict) => Ok(Outcome::Native(dict)),
-        Err(reason) => Ok(Outcome::Defer(reason)),
-    }
-}
-
-fn extract<'py>(
-    py: Python<'py>,
-    path: &str,
-    source: &[u8],
-) -> Result<Bound<'py, PyDict>, &'static str> {
-    if std::str::from_utf8(source).is_err() {
-        return Err("source_not_utf8");
-    }
-    let stem = file_stem(path).ok_or("path_needs_pathlib")?;
-    let file_nid = make_id_ascii(&[path]).ok_or("non_ascii_path")?;
-
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_java::LANGUAGE.into())
-        .map_err(|_| "grammar_load_failed")?;
-    let tree = parser.parse(source, None).ok_or("parse_failed")?;
-    let root = tree.root_node();
-    if root.has_error() {
-        return Err("parse_error");
-    }
-    if tree_depth(root) > MAX_DEPTH {
-        return Err("tree_too_deep");
-    }
-
-    let mut ctx = Ctx {
-        src: source,
-        str_path: path,
-        stem,
-        file_nid: file_nid.clone(),
-        nodes: Vec::new(),
-        seen_ids: HashSet::new(),
-        edges: Vec::new(),
-        raw_calls: Vec::new(),
-        callable_def_nids: HashSet::new(),
-        callable_class_nids: HashSet::new(),
-        function_bodies: Vec::new(),
-        java_field_types: HashMap::new(),
-        java_method_scopes: HashMap::new(),
-        label_to_nid: HashMap::new(),
-        nid_to_sf: HashMap::new(),
-        seen_call_pairs: HashSet::new(),
-        seen_indirect_pairs: HashSet::new(),
-    };
-
-    let file_label = path.rsplit('/').next().unwrap_or(path).to_string();
-    ctx.add_node(&file_nid, &file_label, 1);
-
-    walk::walk(&mut ctx, root, None)?;
-
-    // ── Call-graph pass ─────────────────────────────────────────────────────
-    for n in &ctx.nodes {
-        let mut sf = String::new();
-        let mut label = String::new();
-        for (k, v) in &n.fields {
-            match (*k, v) {
-                ("source_file", Val::S(s)) => sf = s.clone(),
-                ("source_file", Val::Static(s)) => sf = s.to_string(),
-                ("label", Val::S(s)) => label = s.clone(),
-                _ => {}
-            }
-        }
-        ctx.nid_to_sf.insert(n.id.clone(), sf);
-        let normalised = label.trim_matches(|c| c == '(' || c == ')').trim_start_matches('.');
-        ctx.label_to_nid.insert(normalised.to_string(), n.id.clone());
-    }
-
-    // `java_receiver_types`: one table per method body, built BEFORE any body is
-    // walked (Python builds the whole dict comprehension first), because a
-    // method's table is derived from its class's field types and every class has
-    // been walked by now.
-    let scopes: Vec<((usize, usize), (Node, String))> = ctx
-        .java_method_scopes
-        .iter()
-        .map(|(k, (n, c))| (*k, (*n, c.clone())))
-        .collect();
-    let empty_fields: HashMap<String, String> = HashMap::new();
-    let mut receiver_types_by_body: HashMap<(usize, usize), HashMap<String, String>> =
-        HashMap::new();
-    for (body_key, (method_node, class_nid)) in scopes {
-        let fields = ctx.java_field_types.get(&class_nid).unwrap_or(&empty_fields).clone();
-        let table = calls::method_receiver_types(&ctx, method_node, &fields)?;
-        receiver_types_by_body.insert(body_key, table);
-    }
-
-    let bodies: Vec<(String, Node)> = ctx.function_bodies.clone();
-    let empty_table: HashMap<String, String> = HashMap::new();
-    for (caller_nid, body) in bodies {
-        let key = (body.start_byte(), body.end_byte());
-        let table = receiver_types_by_body.get(&key).unwrap_or(&empty_table).clone();
-        calls::walk_calls(&mut ctx, body, &caller_nid, &table)?;
-    }
-
-    // ── Clean edges ─────────────────────────────────────────────────────────
-    let mut clean: Vec<&EdgeRow> = Vec::with_capacity(ctx.edges.len());
-    for e in &ctx.edges {
-        let target_ok = ctx.seen_ids.contains(&e.target)
-            || matches!(e.relation, "imports" | "imports_from" | "re_exports");
-        if ctx.seen_ids.contains(&e.source) && target_ok {
-            clean.push(e);
-        }
-    }
-
-    let out = PyDict::new(py);
-    let nodes = PyList::empty(py);
-    for n in &ctx.nodes {
-        let is_callable = ctx.callable_def_nids.contains(&n.id);
-        let is_class = ctx.callable_class_nids.contains(&n.id);
-        nodes
-            .append(emit::node_to_py(py, n, is_callable, is_class).map_err(|_| "py_error")?)
-            .map_err(|_| "py_error")?;
-    }
-    let edges = PyList::empty(py);
-    for e in clean {
-        edges
-            .append(emit::edge_to_py(py, e).map_err(|_| "py_error")?)
-            .map_err(|_| "py_error")?;
-    }
-    let raw_calls = PyList::empty(py);
-    for c in &ctx.raw_calls {
-        raw_calls
-            .append(emit::raw_call_to_py(py, c).map_err(|_| "py_error")?)
-            .map_err(|_| "py_error")?;
-    }
-    out.set_item("nodes", nodes).map_err(|_| "py_error")?;
-    out.set_item("edges", edges).map_err(|_| "py_error")?;
-    out.set_item("raw_calls", raw_calls).map_err(|_| "py_error")?;
-    Ok(out)
+    crate::engine::run(py, &CONFIG, path, source, calls::method_receiver_types)
 }

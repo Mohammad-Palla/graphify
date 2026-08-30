@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use tree_sitter::Node;
 
 use super::consts::{BUILTIN_TYPES, TYPE_PARAMETER_SCOPES};
-use super::{Ctx, R};
+use crate::engine::{Ctx, R};
 use crate::js::ast::children;
 
 /// `role` in Python's `(name, role)` tuples. An enum rather than a `&str`
