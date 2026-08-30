@@ -32,7 +32,9 @@ use pyo3::types::{PyDict, PyList};
 mod engine;
 mod ids;
 mod c;
+mod cpp;
 mod csharp;
+mod php;
 mod java;
 mod js;
 mod languages;
@@ -185,6 +187,16 @@ fn engine_configs<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         d.set_item(
             "function_boundary_types",
             PyList::new(py, cfg.function_boundary_types)?,
+        )?;
+        d.set_item("static_prop_types", PyList::new(py, cfg.static_prop_types)?)?;
+        d.set_item("helper_fn_names", PyList::new(py, cfg.helper_fn_names)?)?;
+        d.set_item(
+            "container_bind_methods",
+            PyList::new(py, cfg.container_bind_methods)?,
+        )?;
+        d.set_item(
+            "event_listener_properties",
+            PyList::new(py, cfg.event_listener_properties)?,
         )?;
         d.set_item("name_field", cfg.name_field)?;
         d.set_item(

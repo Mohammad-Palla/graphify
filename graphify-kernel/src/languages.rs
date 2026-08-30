@@ -54,6 +54,12 @@ pub type Walker = for<'py> fn(
 /// eShopOnWeb csharp       254  100.0%      0.0%          0
 /// efcore   csharp        5762   91.2%      8.8%          0
 /// libuv    c              367   80.7%     19.3%          0
+/// folly    cpp           2287   65.9%     34.1%          0
+/// leveldb  cpp            128   75.0%     25.0%          0
+/// spdlog   cpp            143   13.3%     86.7%          0
+/// symfony  php          11306   99.8%      0.2%          0
+/// laravel  php           3052  100.0%      0.0%          0
+/// guzzle   php            137  100.0%      0.0%          0
 /// redis    c              756   56.2%     43.8%          0
 /// curl     c             1014   73.7%     26.3%          0
 /// ```
@@ -66,6 +72,16 @@ pub type Walker = for<'py> fn(
 /// `HEAP_EXPORT(void heap_init(struct heap*))`, `TEST_IMPL(foo)`, `WINAPI`. That
 /// is inherent to parsing C without expanding macros, and it caps what any
 /// native C walker can reach at roughly two thirds of a real codebase.
+///
+/// C++ inherits that and adds template metaprogramming. The spread across
+/// corpora is the widest of any language here -- leveldb 75%, folly 66%, spdlog
+/// 13% -- and spdlog is the shape that explains it: a header-only library whose
+/// headers are almost entirely templates and macros. A C++ corpus's native rate
+/// is a property of its house style, so the number to quote is a RANGE.
+///
+/// PHP is the opposite extreme and the best result of any language ported here
+/// after JS/TS and Python: 99.8% over 14,495 files. There is no preprocessor and
+/// no contextual-keyword trap, so essentially every file parses.
 ///
 /// C#'s deferral rate is an order of magnitude above every other language's and
 /// it is NOT a gap in the walker: 8.2% of those 7,177 files make
@@ -94,7 +110,10 @@ pub type Walker = for<'py> fn(
 /// walrus operators, `match`, heavy `typing` generics and `getattr` dispatch that
 /// django's 2,929 files barely use.
 pub fn supported() -> Vec<&'static str> {
-    vec!["typescript", "tsx", "javascript", "python", "java", "csharp", "c"]
+    vec![
+        "typescript", "tsx", "javascript", "python", "java", "csharp", "c", "cpp",
+        "php",
+    ]
 }
 
 pub fn walker_for(language: &str) -> Option<Walker> {
@@ -106,6 +125,8 @@ pub fn walker_for(language: &str) -> Option<Walker> {
         "java" => Some(crate::java::walk_java),
         "csharp" => Some(crate::csharp::walk_csharp),
         "c" => Some(crate::c::walk_c),
+        "cpp" => Some(crate::cpp::walk_cpp),
+        "php" => Some(crate::php::walk_php),
         _ => None,
     }
 }
@@ -131,7 +152,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
 /// The node-kind and field counts change with essentially any grammar revision,
 /// which is what makes the triple a usable proxy for "same grammar".
 pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
-    let langs: [(&'static str, tree_sitter::Language); 7] = [
+    let langs: [(&'static str, tree_sitter::Language); 9] = [
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ("javascript", tree_sitter_javascript::LANGUAGE.into()),
@@ -139,6 +160,8 @@ pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
         ("java", tree_sitter_java::LANGUAGE.into()),
         ("csharp", tree_sitter_c_sharp::LANGUAGE.into()),
         ("c", tree_sitter_c::LANGUAGE.into()),
+        ("cpp", tree_sitter_cpp::LANGUAGE.into()),
+        ("php", tree_sitter_php::LANGUAGE_PHP.into()),
     ];
     langs
         .iter()

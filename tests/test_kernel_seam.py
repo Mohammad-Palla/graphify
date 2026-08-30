@@ -337,12 +337,17 @@ def test_one_language_config_per_routed_grammar():
         # Guard the fields the walker hard-codes, in case the single config is
         # later rebuilt from another one with a tweak.
         cfg = getattr(extract_module, names[0])
-        for field in ("static_prop_types", "helper_fn_names",
-                      "container_bind_methods", "event_listener_properties"):
-            assert not getattr(cfg, field), (
-                f"{names[0]}.{field} is now non-empty; the native walker omits "
-                f"that branch entirely (see src/js/walk.rs) and would drop its edges"
-            )
+        if _GRAMMAR_TO_LANGUAGE[key] not in _engine_languages():
+            # A HAND-WRITTEN walker (js/, py/) omits these branches entirely, so
+            # a non-empty set here would silently drop its edges. An
+            # engine-driven language READS all four from `EngineConfig`; they are
+            # compared field for field by the test below instead.
+            for field in ("static_prop_types", "helper_fn_names",
+                          "container_bind_methods", "event_listener_properties"):
+                assert not getattr(cfg, field), (
+                    f"{names[0]}.{field} is now non-empty; the native walker omits "
+                    f"that branch entirely (see src/js/walk.rs) and would drop its edges"
+                )
         # These two are only meaningful for a HAND-WRITTEN walker (js/, py/),
         # which ignores them: it hard-codes the sets it was written against, so
         # a non-empty tuple here would be silently dropped. An engine-driven
@@ -396,7 +401,11 @@ def test_engine_configs_match_their_language_config():
             by_grammar[(cfg.ts_module, cfg.ts_language_fn)] = (name, cfg)
 
     SET_FIELDS = ("class_types", "function_types", "import_types", "call_types",
-                  "function_boundary_types", "call_accessor_node_types")
+                  "function_boundary_types", "call_accessor_node_types",
+                  # The four Laravel-convention sets. On the config, not
+                  # hard-coded inside `php/`, precisely so this test can see them.
+                  "static_prop_types", "helper_fn_names",
+                  "container_bind_methods", "event_listener_properties")
     TUPLE_FIELDS = ("name_fallback_child_types", "body_fallback_child_types")
     SCALAR_FIELDS = ("name_field", "body_field", "call_function_field",
                      "call_accessor_field", "call_accessor_object_field",

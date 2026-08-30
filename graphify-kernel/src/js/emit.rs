@@ -116,8 +116,19 @@ pub fn edge_to_py<'py>(py: Python<'py>, e: &EdgeRow) -> PyResult<Bound<'py, PyDi
     let d = PyDict::new(py);
     d.set_item("source", &e.source)?;
     d.set_item("target", &e.target)?;
-    d.set_item("relation", e.relation)?;
+    // `relation` is `&'static str` for every edge but PHP's framework ones,
+    // whose relation is BUILT (`uses_{helper}`). Those carry it as the first
+    // field under `__relation`, which is written into the same slot so the key
+    // order is identical either way.
+    if let Some((_, Val::S(r))) = e.fields.first().filter(|(k, _)| *k == "__relation") {
+        d.set_item("relation", r)?;
+    } else {
+        d.set_item("relation", e.relation)?;
+    }
     for (k, v) in &e.fields {
+        if *k == "__relation" {
+            continue;
+        }
         v.set(&d, k)?;
     }
     Ok(d)

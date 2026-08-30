@@ -90,6 +90,17 @@ pub struct EngineConfig {
     pub call_types: &'static [&'static str],
     pub function_boundary_types: &'static [&'static str],
 
+    /// The four FRAMEWORK sets. Empty for every language but PHP, where they
+    /// encode Laravel conventions rather than language syntax. They live on the
+    /// config, exactly as they do on `LanguageConfig`, so
+    /// `test_engine_configs_match_their_language_config` can compare them --
+    /// hard-coding them inside `php/` would put them beyond the reach of the one
+    /// test that checks the two sides agree.
+    pub static_prop_types: &'static [&'static str],
+    pub helper_fn_names: &'static [&'static str],
+    pub container_bind_methods: &'static [&'static str],
+    pub event_listener_properties: &'static [&'static str],
+
     pub name_field: &'static str,
     pub name_fallback_child_types: &'static [&'static str],
     pub body_field: &'static str,
@@ -111,6 +122,12 @@ pub struct EngineConfig {
     /// with a no-op default: `None` selects a DIFFERENT branch, it does not mean
     /// "do nothing".
     pub resolve_function_name: Option<fn(&Ctx, Node) -> R<Option<String>>>,
+
+    /// The result key `Ctx::type_table` is emitted under, when non-empty --
+    /// `"cpp_type_table"` for C++. `None` means the language builds no table, and
+    /// the key is absent rather than empty, matching the Python's `elif
+    /// type_table:` guard.
+    pub type_table_key: Option<&'static str>,
 
     pub hooks: &'static (dyn LangHooks + Sync),
 }
@@ -265,6 +282,50 @@ pub trait LangHooks {
         Vec::new()
     }
 
+    /// Run after the declaration walk and BEFORE the call pass.
+    ///
+    /// The `_is_<lang>` guards between the two walks, which an inventory of the
+    /// walk bodies alone misses: C++ builds its `var -> ClassName` table from
+    /// every function body here (#1547), and Ruby and Swift do the same thing at
+    /// the same point. File-scoped, not per-body -- a later body's `Foo f;` must
+    /// not clobber an earlier binding.
+    fn before_calls<'tree>(&self, _ctx: &mut Ctx<'_, 'tree>) -> R<()> {
+        Ok(())
+    }
+
+    /// Inside the call branch of `walk_calls`, after the edge or raw_call.
+    ///
+    /// PHP's framework blocks live here: a `config('a.b')` helper call and a
+    /// `$this->app->bind(A::class, B::class)` container binding both need the
+    /// resolved `callee_name`, so they cannot run before the call is classified.
+    fn after_call<'tree>(
+        &self,
+        _ctx: &mut Ctx<'_, 'tree>,
+        _node: Node<'tree>,
+        _caller_nid: &str,
+        _info: &CallInfo,
+    ) -> R<()> {
+        Ok(())
+    }
+
+    /// At the BODY level of `walk_calls`, before it recurses -- so it sees every
+    /// node, not only calls. PHP's `Foo::$bar` static-property and `Foo::BAR`
+    /// class-constant edges are emitted here.
+    fn walk_calls_extra<'tree>(
+        &self,
+        _ctx: &mut Ctx<'_, 'tree>,
+        _node: Node<'tree>,
+        _caller_nid: &str,
+    ) -> R<()> {
+        Ok(())
+    }
+
+    /// After the whole call pass. PHP resolves `pending_listen_edges` here,
+    /// because a `$listen` array names classes that may be declared later.
+    fn after_calls<'tree>(&self, _ctx: &mut Ctx<'_, 'tree>) -> R<()> {
+        Ok(())
+    }
+
     /// A per-file name pre-scan, run over the whole tree BEFORE the walk.
     ///
     /// C# is the one caller: `_csharp_pre_scan_interfaces` collects the file's
@@ -378,6 +439,27 @@ pub struct Ctx<'a, 'tree> {
     /// Whatever `LangHooks::prescan` collected for this file. C#: the names
     /// declared as `interface` here.
     pub prescan: HashSet<String>,
+
+    /// `label_to_nid_ci`: the same map as `label_to_nid`, keyed on the
+    /// LOWERCASED label. PHP's framework blocks resolve a class named in a
+    /// string or a `::class` constant, where the source casing is not reliable.
+    pub label_to_nid_ci: HashMap<String, String>,
+
+    /// `seen_helper_ref_pairs` / `seen_static_ref_pairs` / `seen_bind_pairs`,
+    /// merged. The Python keeps three sets; the RELATION is part of every key
+    /// and the three relations are disjoint (`uses_config`, `uses_static_prop`,
+    /// `bound_to`), so one set is exactly equivalent and cannot mix them up.
+    pub seen_rel_triples: HashSet<(String, String, String)>,
+
+    /// `pending_listen_edges`: `(event_class, listener_class, line)` harvested
+    /// during the walk and resolved AFTER the call pass, because a Laravel
+    /// `$listen` array names classes that may be declared later in the file.
+    pub pending_listen_edges: Vec<(String, String, usize)>,
+
+    /// `type_table`: the per-file `var -> ClassName` map the cross-file
+    /// member-call pass uses to type a receiver. Populated by `before_calls` and
+    /// emitted under `EngineConfig::type_table_key`.
+    pub type_table: HashMap<String, String>,
 
     /// The include resolver, for the languages that have one. `None` makes any
     /// file that needs it defer, which is the same rule the JS and Python
@@ -533,6 +615,39 @@ impl<'a, 'tree> Ctx<'a, 'tree> {
             relation,
             fields,
         });
+    }
+
+    /// A framework edge with `confidence_score`, deduped on
+    /// `(source, target, relation)`.
+    ///
+    /// Its own emitter because the key order differs from `add_edge`'s:
+    /// `confidence_score` sits between `confidence` and `source_file`, and there
+    /// is no `context`. The order reaches the exported JSON.
+    pub fn add_edge_scored(
+        &mut self,
+        src: &str,
+        tgt: &str,
+        relation: String,
+        line: usize,
+    ) -> bool {
+        let key = (src.to_string(), tgt.to_string(), relation.clone());
+        if !self.seen_rel_triples.insert(key) {
+            return false;
+        }
+        self.edges.push(EdgeRow {
+            source: src.to_string(),
+            target: tgt.to_string(),
+            relation: "",
+            fields: vec![
+                ("__relation", Val::S(relation)),
+                ("confidence", Val::Static("EXTRACTED")),
+                ("confidence_score", Val::F(1.0)),
+                ("source_file", Val::S(self.str_path.to_string())),
+                ("source_location", Val::S(format!("L{line}"))),
+                ("weight", Val::F(1.0)),
+            ],
+        });
+        true
     }
 
     /// The import edge appended directly by a handler: `context` THIRD, right
@@ -741,6 +856,10 @@ fn extract<'py>(
         namespace_stack: Vec::new(),
         scope_stack: Vec::new(),
         prescan: HashSet::new(),
+        label_to_nid_ci: HashMap::new(),
+        seen_rel_triples: HashSet::new(),
+        pending_listen_edges: Vec::new(),
+        type_table: HashMap::new(),
         path_resolver,
     };
 
@@ -770,7 +889,11 @@ fn extract<'py>(
         ctx.nid_to_sf.insert(n.id.clone(), sf);
         let normalised = label.trim_matches(|c| c == '(' || c == ')').trim_start_matches('.');
         ctx.label_to_nid.insert(normalised.to_string(), n.id.clone());
+        ctx.label_to_nid_ci
+            .insert(normalised.to_lowercase(), n.id.clone());
     }
+
+    cfg.hooks.before_calls(&mut ctx)?;
 
     // Every per-method receiver table is built BEFORE any body is walked, as in
     // Python, where the whole dict comprehension is evaluated up front.
@@ -793,6 +916,7 @@ fn extract<'py>(
         let table = tables.get(&key).unwrap_or(&no_table);
         calls::walk_calls(&mut ctx, body, &caller_nid, table)?;
     }
+    cfg.hooks.after_calls(&mut ctx)?;
 
     // ── Clean edges ─────────────────────────────────────────────────────────
     let mut clean: Vec<&EdgeRow> = Vec::with_capacity(ctx.edges.len());
@@ -828,6 +952,22 @@ fn extract<'py>(
     out.set_item("nodes", nodes).map_err(|_| "py_error")?;
     out.set_item("edges", edges).map_err(|_| "py_error")?;
     out.set_item("raw_calls", raw_calls).map_err(|_| "py_error")?;
+    // `elif type_table:` -- absent, not empty, when nothing was recorded.
+    if let Some(key) = cfg.type_table_key {
+        if !ctx.type_table.is_empty() {
+            let d = PyDict::new(py);
+            d.set_item("path", path).map_err(|_| "py_error")?;
+            let t = PyDict::new(py);
+            // Sorted: Python inserts in walk order, and a HashMap has none.
+            let mut pairs: Vec<(&String, &String)> = ctx.type_table.iter().collect();
+            pairs.sort();
+            for (k, v) in pairs {
+                t.set_item(k, v).map_err(|_| "py_error")?;
+            }
+            d.set_item("table", t).map_err(|_| "py_error")?;
+            out.set_item(key, d).map_err(|_| "py_error")?;
+        }
+    }
     Ok(out)
 }
 
@@ -841,7 +981,13 @@ fn extract<'py>(
 /// can check the real thing, field for field. That check gets stronger with each
 /// language added rather than needing a new exemption.
 pub fn engine_configs() -> Vec<&'static EngineConfig> {
-    vec![&crate::java::CONFIG, &crate::csharp::CONFIG, &crate::c::CONFIG]
+    vec![
+        &crate::java::CONFIG,
+        &crate::csharp::CONFIG,
+        &crate::c::CONFIG,
+        &crate::cpp::CONFIG,
+        &crate::php::CONFIG,
+    ]
 }
 
 /// The default for a language that builds no receiver table.

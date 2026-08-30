@@ -621,6 +621,10 @@ pub static CONFIG: EngineConfig = EngineConfig {
     // links the constructing method to Foo, the way Java has since #1373.
     call_types: &["invocation_expression", "object_creation_expression"],
     function_boundary_types: &["method_declaration"],
+    static_prop_types: &[],
+    helper_fn_names: &[],
+    container_bind_methods: &[],
+    event_listener_properties: &[],
     name_field: "name",
     name_fallback_child_types: &[],
     body_field: "body",
@@ -631,6 +635,7 @@ pub static CONFIG: EngineConfig = EngineConfig {
     call_accessor_object_field: "",
     function_label_parens: true,
     resolve_function_name: None,
+    type_table_key: None,
     hooks: &HOOKS,
 };
 

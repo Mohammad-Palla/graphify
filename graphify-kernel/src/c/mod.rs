@@ -182,6 +182,10 @@ pub static CONFIG: EngineConfig = EngineConfig {
     import_types: &["preproc_include"],
     call_types: &["call_expression"],
     function_boundary_types: &["function_definition"],
+    static_prop_types: &[],
+    helper_fn_names: &[],
+    container_bind_methods: &[],
+    event_listener_properties: &[],
     name_field: "name",
     name_fallback_child_types: &[],
     body_field: "body",
@@ -192,6 +196,7 @@ pub static CONFIG: EngineConfig = EngineConfig {
     call_accessor_object_field: "",
     function_label_parens: true,
     resolve_function_name: Some(resolve_function_name),
+    type_table_key: None,
     hooks: &HOOKS,
 };
 

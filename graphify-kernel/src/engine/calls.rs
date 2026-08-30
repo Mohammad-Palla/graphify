@@ -165,7 +165,13 @@ pub fn walk_calls<'tree>(
                 }
             }
         }
+        // Runs whatever the defer decision was, and even for a builtin-global
+        // callee: the Python's helper / container-binding blocks sit after the
+        // whole `if callee_name ...` chain, not inside it.
+        hooks.after_call(ctx, node, caller_nid, &info)?;
     }
+
+    hooks.walk_calls_extra(ctx, node, caller_nid)?;
 
     // The indirect-dispatch block is `if _is_python`, and `py/` is not on this
     // engine, so there is nothing between the call branch and the recursion.
