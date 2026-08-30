@@ -19,6 +19,10 @@ tree-sitter-javascript = "0.25"
 # 32 fields). `languages::grammar_fingerprints` enforces it at load time --
 # see that function for the JS 0.23-vs-0.25 skew that motivated the check.
 tree-sitter-python = "0.25"
+# Each of these was verified to produce the SAME (abi, node_kind_count,
+# field_count) as the installed Python package before being added -- see
+# `languages::grammar_fingerprints`, which re-checks it at load time.
+tree-sitter-java = "0.23.5"
 
 [profile.release]
 opt-level = 3

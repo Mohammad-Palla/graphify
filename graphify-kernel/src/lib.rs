@@ -30,6 +30,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 mod ids;
+mod java;
 mod js;
 mod languages;
 mod py;

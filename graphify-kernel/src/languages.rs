@@ -46,6 +46,9 @@ pub type Walker = for<'py> fn(
 /// django   python        2929   99.9%      0.1%          0
 /// bun      python           8  100.0%      0.0%          0
 /// graphify python         346  100.0%      0.0%          0
+/// guava    java          3275   99.6%      0.4%          0
+/// gson     java           264  100.0%      0.0%          0
+/// java     java            50  100.0%      0.0%          0
 /// ```
 ///
 /// The residual deferrals are, in order: a parse error (Python's recovery is
@@ -60,7 +63,7 @@ pub type Walker = for<'py> fn(
 /// walrus operators, `match`, heavy `typing` generics and `getattr` dispatch that
 /// django's 2,929 files barely use.
 pub fn supported() -> Vec<&'static str> {
-    vec!["typescript", "tsx", "javascript", "python"]
+    vec!["typescript", "tsx", "javascript", "python", "java"]
 }
 
 pub fn walker_for(language: &str) -> Option<Walker> {
@@ -69,6 +72,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
         "tsx" => Some(crate::js::walk_tsx),
         "javascript" => Some(crate::js::walk_javascript),
         "python" => Some(crate::py::walk_python),
+        "java" => Some(crate::java::walk_java),
         _ => None,
     }
 }
@@ -94,7 +98,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
 /// The node-kind and field counts change with essentially any grammar revision,
 /// which is what makes the triple a usable proxy for "same grammar".
 pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
-    let langs: [(&'static str, tree_sitter::Language); 4] = [
+    let langs: [(&'static str, tree_sitter::Language); 5] = [
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ("javascript", tree_sitter_javascript::LANGUAGE.into()),
@@ -102,6 +106,7 @@ pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
         // proven by the same mechanism from the walker's first parity run rather
         // than being switched on with it.
         ("python", tree_sitter_python::LANGUAGE.into()),
+        ("java", tree_sitter_java::LANGUAGE.into()),
     ];
     langs
         .iter()
