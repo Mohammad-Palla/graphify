@@ -108,6 +108,48 @@ def _split_keyword(text: str, keyword: str) -> tuple[str, str] | None:
     return None
 
 
+# `CREATE POLICY <name> ON <table> ...;` -- line-anchored and running to the
+# first `;`, exactly like the grant scan and for the same reason: the grammar
+# has no POLICY rule either.
+_POLICY_STMT = re.compile(
+    r"^[ \t]*CREATE\s+POLICY\s+(?P<name>" + _PART + r")"
+    r"\s+ON\s+(?P<table>" + _PART + r"(?:\s*\.\s*" + _PART + r")*)"
+    r"(?P<rest>.*?);",
+    re.IGNORECASE | re.MULTILINE | re.DOTALL,
+)
+# The clauses that end the role/command header and begin the expressions.
+_POLICY_BODY = re.compile(r"\b(?:USING|WITH\s+CHECK)\b", re.IGNORECASE)
+_POLICY_FOR = re.compile(r"\bFOR\s+(ALL|SELECT|INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
+
+
+def _parse_policy(rest: str) -> tuple[str | None, list[str]]:
+    """Split a CREATE POLICY tail into (command, roles).
+
+    `roles` is empty when the statement has no TO clause, which is the majority
+    case (127 of 163 measured). Postgres then applies the policy to PUBLIC; the
+    caller materialises that as an INFERRED edge rather than an EXTRACTED one,
+    because the role is a language default and is not written in the source.
+
+    Everything from USING / WITH CHECK onward is dropped. Those are arbitrary
+    SQL expressions that can contain the words FOR and TO, and can name tables
+    this policy does not "apply to" in any sense worth an edge.
+    """
+    body = _POLICY_BODY.search(rest)
+    head = rest[: body.start()] if body else rest
+
+    command_match = _POLICY_FOR.search(head)
+    command = command_match.group(1).upper() if command_match else None
+
+    roles: list[str] = []
+    split_to = _split_keyword(head, "TO")
+    if split_to is not None:
+        for raw in _split_top_level(split_to[1]):
+            role_match = _ROLE_NAME.match(_ROLE_QUALIFIER.sub("", raw).strip())
+            if role_match:
+                roles.append(role_match.group(1))
+    return command, roles
+
+
 def _parse_grant(verb: str, body: str) -> tuple[str, list[str], list[str]] | None:
     """Split a GRANT/REVOKE body into (privileges, objects, roles).
 
@@ -268,10 +310,16 @@ def extract_sql(path: Path, content: str | bytes | None = None) -> dict:
                            "source_location": f"L{line}", "weight": 1.0})
 
     def _add_edge(src: str, tgt: str, relation: str, line: int,
-                  privileges: str | None = None) -> None:
+                  privileges: str | None = None, command: str | None = None,
+                  confidence: str = "EXTRACTED") -> None:
         edge = {"source": src, "target": tgt, "relation": relation,
-                "confidence": "EXTRACTED", "source_file": str_path,
+                "confidence": confidence, "source_file": str_path,
                 "source_location": f"L{line}", "weight": 1.0}
+        if command is not None:
+            # Which statements the policy covers (`FOR SELECT`). Only ever set
+            # when the source says so -- an absent FOR means ALL, and inventing
+            # that value inside an EXTRACTED edge is the thing being avoided.
+            edge["command"] = command
         if privileges is not None:
             # Which privileges, verbatim from the statement. The whole point of
             # a grant edge is WHAT was granted: "never grant execute to anon" is
@@ -746,5 +794,52 @@ def extract_sql(path: Path, content: str | bytes | None = None) -> dict:
             for role in roles:
                 _add_edge(obj_nid, _role_stub(role), relation, line,
                           privileges=privileges)
+
+    # ── CREATE POLICY ─────────────────────────────────────────────────────────
+    # Same story as GRANT/REVOKE: no grammar rule, so a whole-file text scan.
+    # 163 CREATE POLICY statements across the corpora produced nothing at all --
+    # no node, no edge -- so row-level security was entirely invisible.
+    #
+    # ALTER POLICY and DROP POLICY (70 more) are deliberately NOT handled. The
+    # graph is a static snapshot with no notion of statement order, so merging an
+    # ALTER's role list into the CREATE's would claim the policy applies to the
+    # union of every role it ever had, and `ALTER POLICY p ON t RENAME TO x`
+    # would read `x` as a role. Silence beats either.
+    for m in _POLICY_STMT.finditer(src_text):
+        line = src_text[: m.start()].count("\n") + 1
+        pol_name = m.group("name")
+        tbl_name = m.group("table")
+        # Keyed on (file, TABLE, policy name), because that is how SQL itself
+        # namespaces a policy: `CREATE POLICY p1 ON t1` and `CREATE POLICY p1 ON
+        # t2` are two different policies, and a policy `foo` is unrelated to a
+        # TABLE `foo`. Keying on (file, name) alone did both kinds of damage --
+        # measured on postgres, a policy `foo` collided with the table `foo` in
+        # the same file, `_add_node` deduped them onto one node, and the graph's
+        # same-endpoint edge collapse then DROPPED that table's `references`
+        # edge. A new node kind must not enter an existing id space.
+        pol_nid = _make_id(stem, tbl_name, pol_name)
+        # Labelled `policy <name>`, not the bare name, for the same reason roles
+        # are labelled `role <name>`: `_rewire_unique_stub_nodes` picks its
+        # rewire targets by label key, and a policy is not a table, so an
+        # unresolved table reference must never bind to one. Measured on
+        # postgres: policies named `p`, `p1`, `p2` entered that label space and
+        # silently changed a cross-file `reads_from` in an unrelated file.
+        _add_node(pol_nid, f"policy {pol_name}", line)
+
+        tbl_nid = table_nids.get(_norm_ident(tbl_name)) or _ref_stub(tbl_name)
+        _add_edge(pol_nid, tbl_nid, "secures", line)
+
+        command, roles = _parse_policy(m.group("rest"))
+        for role in roles:
+            _add_edge(pol_nid, _role_stub(role), "applies_to", line,
+                      command=command)
+        if not roles:
+            # "If no role is specified, the policy applies to PUBLIC" -- the
+            # documented Postgres default. Materialised, because a policy that
+            # silently applies to everyone is the case an audit most needs to
+            # see, and tagged INFERRED because the role is not in the text. That
+            # distinction is what the confidence vocabulary is for.
+            _add_edge(pol_nid, _role_stub("public"), "applies_to", line,
+                      command=command, confidence="INFERRED")
 
     return {"nodes": nodes, "edges": edges}

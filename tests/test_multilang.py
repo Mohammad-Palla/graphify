@@ -940,3 +940,114 @@ def test_sql_grant_parses_tsql_and_quoted_dialects(tmp_path):
             "revokes_from", "SELECT") in edges
     targets = {t for _, t, _, _ in edges}
     assert {"sql_role_finance_team", "sql_role_svc"} <= targets
+
+
+def _policy_edges(result):
+    return [e for e in result["edges"]
+            if e["relation"] in ("secures", "applies_to")]
+
+
+def test_sql_create_policy_emits_node_table_and_roles(tmp_path):
+    """163 CREATE POLICY statements produced no node and no edge, so row-level
+    security was entirely invisible."""
+    pytest.importorskip("tree_sitter_sql")
+    (tmp_path / "p.sql").write_text(
+        "CREATE TABLE docs (id int, owner text);\n"
+        "CREATE POLICY docs_owner ON docs FOR SELECT TO anon, authenticated\n"
+        "  USING (owner = current_user);\n", encoding="utf-8")
+
+    result = extract_sql(tmp_path / "p.sql")
+    # Labelled `policy <name>`, keeping policies out of the table label space
+    # that `_rewire_unique_stub_nodes` picks its rewire targets from.
+    pol_nid = next(n["id"] for n in result["nodes"]
+                   if n["label"] == "policy docs_owner")
+    table_nid = next(n["id"] for n in result["nodes"] if n["label"] == "docs")
+
+    got = {(e["source"], e["target"], e["relation"],
+            e["confidence"], e.get("command")) for e in result["edges"]
+           if e["relation"] in ("secures", "applies_to")}
+    assert got == {
+        (pol_nid, table_nid, "secures", "EXTRACTED", None),
+        (pol_nid, "sql_role_anon", "applies_to", "EXTRACTED", "SELECT"),
+        (pol_nid, "sql_role_authenticated", "applies_to", "EXTRACTED", "SELECT"),
+    }
+
+
+def test_sql_policy_without_to_clause_is_inferred_public(tmp_path):
+    """Postgres: "If no role is specified, the policy applies to PUBLIC" -- the
+    majority case, 127 of 163 measured.
+
+    Materialised, because a policy that silently applies to everyone is what an
+    audit most needs to see. Tagged INFERRED, because the role is a language
+    default and is not written in the source -- which is exactly what the
+    EXTRACTED/INFERRED/AMBIGUOUS vocabulary is for.
+    """
+    pytest.importorskip("tree_sitter_sql")
+    (tmp_path / "p.sql").write_text(
+        "CREATE TABLE docs (id int);\n"
+        "CREATE POLICY docs_all ON docs USING (true);\n", encoding="utf-8")
+
+    result = extract_sql(tmp_path / "p.sql")
+    pol_nid = next(n["id"] for n in result["nodes"]
+                   if n["label"] == "policy docs_all")
+    applies = [e for e in result["edges"] if e["relation"] == "applies_to"]
+    assert len(applies) == 1
+    assert applies[0]["source"] == pol_nid
+    assert applies[0]["target"] == "sql_role_public"
+    assert applies[0]["confidence"] == "INFERRED"
+    assert "command" not in applies[0]
+
+
+def test_sql_alter_and_drop_policy_are_not_parsed(tmp_path):
+    """A static graph has no statement order, so folding an ALTER's role list
+    into the CREATE's would claim the union of every role the policy ever had --
+    and `RENAME TO x` would read `x` as a role.
+    """
+    pytest.importorskip("tree_sitter_sql")
+    (tmp_path / "p.sql").write_text(
+        "CREATE TABLE docs (id int);\n"
+        "ALTER POLICY docs_all ON docs RENAME TO renamed;\n"
+        "ALTER POLICY docs_all ON docs TO some_other_role;\n"
+        "DROP POLICY docs_all ON docs;\n", encoding="utf-8")
+
+    result = extract_sql(tmp_path / "p.sql")
+    assert _policy_edges(result) == []
+    assert not [n for n in result["nodes"]
+                if str(n["id"]).startswith("sql_role_")]
+
+
+def test_sql_policy_using_expression_is_not_mined_for_roles(tmp_path):
+    """USING / WITH CHECK are arbitrary SQL that can contain FOR and TO."""
+    pytest.importorskip("tree_sitter_sql")
+    (tmp_path / "p.sql").write_text(
+        "CREATE TABLE docs (id int);\n"
+        "CREATE POLICY p ON docs USING (id IN (SELECT id FROM other TO_X));\n",
+        encoding="utf-8")
+
+    roles = {e["target"] for e in _policy_edges(extract_sql(tmp_path / "p.sql"))
+             if e["relation"] == "applies_to"}
+    assert roles == {"sql_role_public"}
+
+
+def test_sql_policy_id_is_namespaced_by_its_table(tmp_path):
+    """A policy name is scoped to its table, and is unrelated to a TABLE name.
+
+    Keying on (file, name) alone did both kinds of damage. Measured on postgres:
+    a policy `foo` collided with the table `foo` in the same file, `_add_node`
+    deduped them onto one node, and the graph's same-endpoint edge collapse then
+    DROPPED that table's `references` edge.
+    """
+    pytest.importorskip("tree_sitter_sql")
+    (tmp_path / "p.sql").write_text(
+        "CREATE TABLE foo (id int);\n"
+        "CREATE TABLE bar (id int);\n"
+        "CREATE POLICY foo ON foo USING (true);\n"
+        "CREATE POLICY foo ON bar USING (true);\n", encoding="utf-8")
+
+    result = extract_sql(tmp_path / "p.sql")
+    table_foo = next(n["id"] for n in result["nodes"] if n["label"] == "foo")
+    policies = [n["id"] for n in result["nodes"] if n["label"] == "policy foo"]
+    # Two policies named `foo` on two tables are two nodes...
+    assert len(policies) == 2, policies
+    # ...and neither is the table.
+    assert table_foo not in policies

@@ -110,6 +110,11 @@ struct Patterns {
     role_name: Regex,
     /// A routine's trailing argument list, dropped so the node keys on the name.
     arg_list: Regex,
+    /// `CREATE POLICY <name> ON <table> ...;`
+    policy_stmt: Regex,
+    /// The clauses that end a policy's role/command header.
+    policy_body: Regex,
+    policy_for: Regex,
 }
 
 impl Patterns {
@@ -166,6 +171,13 @@ impl Patterns {
                 r"^({np})(?:\s*@\s*{np})?$", np = NAME_PART))
                 .expect("role_name"),
             arg_list: Regex::new(r"(?s)\s*\(.*\)\s*$").expect("arg_list"),
+            policy_stmt: Regex::new(&format!(
+                r"(?ims)^[ \t]*CREATE\s+POLICY\s+(?P<name>{np})\s+ON\s+(?P<table>{np}(?:\s*\.\s*{np})*)(?P<rest>.*?);",
+                np = NAME_PART))
+                .expect("policy_stmt"),
+            policy_body: Regex::new(r"(?i)\b(?:USING|WITH\s+CHECK)\b").expect("policy_body"),
+            policy_for: Regex::new(r"(?i)\bFOR\s+(ALL|SELECT|INSERT|UPDATE|DELETE)\b")
+                .expect("policy_for"),
         }
     }
 }
@@ -336,6 +348,38 @@ fn parse_grant(p: &Patterns, verb: &str, body: &str) -> Option<(String, Vec<Stri
         return None;
     }
     Some((collapse_ws(privileges_part).to_uppercase(), objects, roles))
+}
+
+/// `_parse_policy`: split a CREATE POLICY tail into (command, roles).
+///
+/// `roles` is empty when there is no TO clause, the majority case (127 of 163
+/// measured). Postgres then applies the policy to PUBLIC, and the caller
+/// materialises that as an INFERRED edge -- the role is a language default, not
+/// something written in the source.
+///
+/// Everything from USING / WITH CHECK onward is dropped: those are arbitrary SQL
+/// expressions that can contain the words FOR and TO, and can name tables the
+/// policy does not "apply to" in any sense worth an edge.
+fn parse_policy(p: &Patterns, rest: &str) -> (Option<String>, Vec<String>) {
+    let head = match p.policy_body.find(rest) {
+        Some(m) => &rest[..m.start()],
+        None => rest,
+    };
+    let command = p
+        .policy_for
+        .captures(head)
+        .map(|c| c[1].to_uppercase());
+
+    let mut roles: Vec<String> = Vec::new();
+    if let Some((_, roles_part)) = split_keyword(head, &p.kw_to) {
+        for raw in split_top_level(roles_part) {
+            let name = p.role_qualifier.replace(&raw, "").trim().to_string();
+            if let Some(rm) = p.role_name.captures(&name) {
+                roles.push(rm[1].to_string());
+            }
+        }
+    }
+    (command, roles)
 }
 
 struct Ctx<'a> {
@@ -514,6 +558,32 @@ impl<'a> Ctx<'a> {
                 ("weight", Val::F(1.0)),
                 ("privileges", Val::S(privileges.to_string())),
             ],
+        });
+    }
+
+    /// `add_edge` plus an optional trailing `command`, and a settable
+    /// confidence.
+    ///
+    /// `command` is set ONLY when the source says `FOR <cmd>`: an absent FOR
+    /// means ALL, and writing that value into an EXTRACTED edge would be the
+    /// invented-fact-at-confidence-1.0 problem in miniature.
+    fn add_policy_edge(&mut self, src: &str, tgt: &str, relation: &'static str,
+                       line: usize, command: Option<&str>,
+                       confidence: &'static str) {
+        let mut fields = vec![
+            ("confidence", Val::Static(confidence)),
+            ("source_file", Val::S(self.str_path.to_string())),
+            ("source_location", Val::S(format!("L{line}"))),
+            ("weight", Val::F(1.0)),
+        ];
+        if let Some(cmd) = command {
+            fields.push(("command", Val::S(cmd.to_string())));
+        }
+        self.edges.push(EdgeRow {
+            source: src.to_string(),
+            target: tgt.to_string(),
+            relation,
+            fields,
         });
     }
 
@@ -1042,6 +1112,62 @@ fn extract<'py>(
                 let role_nid = ctx.role_stub(role)?;
                 ctx.add_grant_edge(&obj_nid, &role_nid, relation, line, &privileges);
             }
+        }
+    }
+
+    // ── CREATE POLICY ────────────────────────────────────────────────────────
+    // Same story as GRANT/REVOKE: no grammar rule, so a whole-file text scan.
+    // 163 CREATE POLICY statements across the corpora produced nothing at all --
+    // no node, no edge -- so row-level security was entirely invisible.
+    //
+    // ALTER POLICY and DROP POLICY (70 more) are deliberately NOT handled. The
+    // graph is a static snapshot with no notion of statement order, so folding
+    // an ALTER's role list into the CREATE's would claim the policy applies to
+    // the union of every role it ever had, and `ALTER POLICY p ON t RENAME TO x`
+    // would read `x` as a role. Silence beats either.
+    for m in p.policy_stmt.captures_iter(src_text) {
+        let whole = m.get(0).unwrap();
+        let line = line_offset(src_text, whole.start()) + 1;
+        let pol_name = m.name("name").unwrap().as_str().to_string();
+        let tbl_name = m.name("table").unwrap().as_str().to_string();
+        let rest = m.name("rest").unwrap().as_str().to_string();
+
+        // Keyed on (file, TABLE, policy name): that is how SQL namespaces a
+        // policy. `CREATE POLICY p1 ON t1` and `p1 ON t2` are two policies, and
+        // a policy `foo` is unrelated to a TABLE `foo`. Keying on (file, name)
+        // alone collided a policy `foo` with the table `foo` in the same
+        // postgres file; `add_node` deduped them onto one node and the graph's
+        // same-endpoint collapse then dropped that table's `references` edge.
+        let stem = ctx.stem.clone();
+        let pol_nid = ctx.mkid(&[&stem, &tbl_name, &pol_name])?;
+        // Labelled `policy <name>`, like roles are `role <name>`:
+        // `_rewire_unique_stub_nodes` picks rewire targets by label key, and a
+        // policy is not a table, so an unresolved table reference must never
+        // bind to one. Measured on postgres: policies named `p`/`p1`/`p2`
+        // entered that label space and changed a cross-file `reads_from`.
+        ctx.add_node(&pol_nid, &format!("policy {pol_name}"), line);
+
+        let by_table = ctx.table_get(&norm_ident(&tbl_name)).map(str::to_string);
+        let tbl_nid = match by_table {
+            Some(nid) => nid,
+            None => ctx.ref_stub(&tbl_name)?,
+        };
+        ctx.add_policy_edge(&pol_nid, &tbl_nid, "secures", line, None, "EXTRACTED");
+
+        let (command, roles) = parse_policy(p, &rest);
+        let cmd = command.as_deref();
+        for role in &roles {
+            let role_nid = ctx.role_stub(role)?;
+            ctx.add_policy_edge(&pol_nid, &role_nid, "applies_to", line, cmd, "EXTRACTED");
+        }
+        if roles.is_empty() {
+            // "If no role is specified, the policy applies to PUBLIC" -- the
+            // documented Postgres default. Materialised, because a policy that
+            // silently applies to everyone is the case an audit most needs to
+            // see, and tagged INFERRED because the role is not in the text.
+            // That distinction is what the confidence vocabulary is for.
+            let role_nid = ctx.role_stub("public")?;
+            ctx.add_policy_edge(&pol_nid, &role_nid, "applies_to", line, cmd, "INFERRED");
         }
     }
 
