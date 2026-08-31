@@ -52,6 +52,31 @@ use crate::Outcome;
 /// Each is the Python literal, transliterated. `(?i)` is `re.IGNORECASE`; `\w`
 /// is Unicode in both engines; the `regex` crate's `find_iter` is leftmost-first
 /// and non-overlapping, matching `re.finditer`.
+/// One name part: bare, or delimited by `""`, ``` `` ```, `''` or `[]`. A
+/// delimited part may hold anything but its own delimiter -- a Databricks role
+/// is routinely `finance-team`, whose hyphen no `\w` class will match.
+const NAME_PART: &str = r#"(?:"[^"\n]+"|`[^`\n]+`|'[^'\n]+'|\[[^\]\n]+\]|[\w$]+)"#;
+
+/// Object types that ARE graph entities. Postgres defaults to TABLE when the
+/// keyword is omitted, so the keyword is optional at the call site.
+const GRANTABLE_OBJECT_TYPES: &[&str] = &[
+    "materialized view", "foreign table", "procedure", "function",
+    "sequence", "routine", "table", "view",
+];
+
+/// Object types that are NOT graph entities. A grant on one of these is real,
+/// correctly parsed SQL -- there is simply no node to hang it on, so nothing is
+/// emitted rather than a stub being invented for a database or a schema.
+const UNGRAPHED_OBJECT_TYPES: &[&str] = &[
+    "all tables in schema", "all sequences in schema", "all functions in schema",
+    "all procedures in schema", "all routines in schema",
+    "foreign data wrapper", "foreign server", "large object", "tablespace",
+    "database", "language", "parameter", "schema", "domain", "type",
+    "property graph",
+    "external location", "storage credential", "metastore", "connection",
+    "catalog", "share", "provider", "recipient",
+];
+
 struct Patterns {
     /// `CREATE [OR REPLACE] FUNCTION|PROCEDURE [IF NOT EXISTS] <qualified name>`,
     /// where each part is bare or double-quoted -- a bare `[\w$.]+` stopped dead
@@ -71,6 +96,20 @@ struct Patterns {
     create_table_open: Regex,
     /// The end of a `CREATE TABLE` block, for the whole-file REFERENCES scan.
     block_end: Regex,
+    /// A GRANT/REVOKE statement: line-anchored, running to the first `;`.
+    grant_stmt: Regex,
+    /// `\bON\b`, `\bTO\b`, `\bFROM\b` -- the clause separators.
+    kw_on: Regex,
+    kw_to: Regex,
+    kw_from: Regex,
+    grant_tail: Regex,
+    revoke_option_for: Regex,
+    role_qualifier: Regex,
+    tsql_securable_class: Regex,
+    object_name: Regex,
+    role_name: Regex,
+    /// A routine's trailing argument list, dropped so the node keys on the name.
+    arg_list: Regex,
 }
 
 impl Patterns {
@@ -102,6 +141,31 @@ impl Patterns {
                 .expect("create_table_open"),
             block_end: Regex::new(r"(?i)(?:^|\n)(?:CREATE|SET\s+TERM|ALTER)\s")
                 .expect("block_end"),
+            // `(?ims)`: line-anchored `^`, case-insensitive, and `.` spans
+            // newlines because a grant on a routine routinely wraps.
+            grant_stmt: Regex::new(r"(?ims)^[ \t]*(GRANT|REVOKE)\b(.*?);")
+                .expect("grant_stmt"),
+            kw_on: Regex::new(r"(?i)\bON\b").expect("kw_on"),
+            kw_to: Regex::new(r"(?i)\bTO\b").expect("kw_to"),
+            kw_from: Regex::new(r"(?i)\bFROM\b").expect("kw_from"),
+            // `format!`, not `concat!`: NAME_PART is a const, and `concat!`
+            // takes only literals.
+            grant_tail: Regex::new(&format!(
+                r"(?i)\s+(?:WITH\s+(?:GRANT|ADMIN|INHERIT|SET)\s+OPTION|GRANTED\s+BY\s+{np}|AS\s+{np}|CASCADE|RESTRICT)\s*$",
+                np = NAME_PART))
+                .expect("grant_tail"),
+            revoke_option_for: Regex::new(r"(?i)^\s*(?:GRANT|ADMIN)\s+OPTION\s+FOR\b")
+                .expect("revoke_option_for"),
+            role_qualifier: Regex::new(r"(?i)^(?:GROUP|ROLE|USER)\s+").expect("role_qualifier"),
+            tsql_securable_class: Regex::new(r"(?i)^([A-Za-z_]+)\s*::\s*")
+                .expect("tsql_securable_class"),
+            object_name: Regex::new(&format!(
+                r"^{np}(?:\s*\.\s*{np})*$", np = NAME_PART))
+                .expect("object_name"),
+            role_name: Regex::new(&format!(
+                r"^({np})(?:\s*@\s*{np})?$", np = NAME_PART))
+                .expect("role_name"),
+            arg_list: Regex::new(r"(?s)\s*\(.*\)\s*$").expect("arg_list"),
         }
     }
 }
@@ -142,6 +206,136 @@ fn norm_ident(name: &str) -> String {
 /// The 1-based line of a byte offset inside `text`, added to a base line.
 fn line_offset(text: &str, upto: usize) -> usize {
     text[..upto].matches('\n').count()
+}
+
+/// `_split_top_level`: split on commas that are NOT inside parentheses.
+///
+/// A routine's argument list is comma-separated too, so a naive split tears
+/// `FUNCTION f(uuid, text), g(int)` into four objects instead of two.
+fn split_top_level(text: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut current = String::new();
+    for ch in text.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            _ => {}
+        }
+        if ch == ',' && depth == 0 {
+            parts.push(std::mem::take(&mut current));
+        } else {
+            current.push(ch);
+        }
+    }
+    parts.push(current);
+    parts
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// `_split_keyword`: split at the first TOP-LEVEL whole-word occurrence.
+///
+/// Top-level because a routine signature can contain the word inside its
+/// parentheses; first because the trailing clauses (`WITH GRANT OPTION`) come
+/// after the role list, never before it.
+fn split_keyword<'t>(text: &'t str, kw: &Regex) -> Option<(&'t str, &'t str)> {
+    for m in kw.find_iter(text) {
+        let before = &text[..m.start()];
+        let depth = before.matches('(').count() as i64 - before.matches(')').count() as i64;
+        if depth <= 0 {
+            return Some((before, &text[m.end()..]));
+        }
+    }
+    None
+}
+
+/// Python's `" ".join(s.split())`.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+/// `_parse_grant`: split a GRANT/REVOKE body into (privileges, objects, roles).
+///
+/// `None` means "well-formed SQL this graph has no node for", and the caller
+/// then emits NOTHING. That is the point: the failure being replaced is a
+/// guessed edge shipped as EXTRACTED at confidence 1.0, and a grant on a
+/// DATABASE has no object node to point at.
+fn parse_grant(p: &Patterns, verb: &str, body: &str) -> Option<(String, Vec<String>, Vec<String>)> {
+    let body = p.revoke_option_for.replace(body, "");
+    // No ON => role membership (`GRANT admin TO alice`); both sides are roles,
+    // so there is no object to carry a privilege edge.
+    let (privileges_part, rest) = split_keyword(&body, &p.kw_on)?;
+
+    // Postgres spells it `REVOKE ... FROM role`; T-SQL spells it
+    // `REVOKE ... TO role`. Try the dialect-native keyword, then the other --
+    // 25 corpus statements are T-SQL and were dropped by FROM alone.
+    let primary = if verb == "GRANT" { &p.kw_to } else { &p.kw_from };
+    let (objects_part, roles_part) = match split_keyword(rest, primary) {
+        Some(v) => v,
+        None if verb == "REVOKE" => split_keyword(rest, &p.kw_to)?,
+        None => return None,
+    };
+
+    let mut objects_part = objects_part.trim().to_string();
+    if let Some(cm) = p.tsql_securable_class.captures(&objects_part) {
+        // T-SQL scopes by class: `OBJECT::t`, `TYPE::t`, `SCHEMA::s`. Only
+        // OBJECT names something this graph holds.
+        if cm[1].to_lowercase() != "object" {
+            return None;
+        }
+        let end = cm.get(0).unwrap().end();
+        objects_part = objects_part[end..].trim().to_string();
+    }
+    let lowered = objects_part.to_lowercase();
+    if UNGRAPHED_OBJECT_TYPES.iter().any(|t| lowered.starts_with(t)) {
+        return None;
+    }
+    for object_type in GRANTABLE_OBJECT_TYPES {
+        if lowered.starts_with(&format!("{object_type} "))
+            || lowered.starts_with(&format!("{object_type}\n"))
+        {
+            objects_part = objects_part[object_type.len()..].trim().to_string();
+            break;
+        }
+    }
+
+    let mut objects: Vec<String> = Vec::new();
+    for raw in split_top_level(&objects_part) {
+        let name = p.arg_list.replace(&raw, "").trim().to_string();
+        // `GRANT ... ON db_name.* TO x` (MySQL) names a whole database, not an
+        // object, so there is nothing to point an edge at.
+        if !name.is_empty() && !name.ends_with(".*") && p.object_name.is_match(&name) {
+            objects.push(name);
+        }
+    }
+
+    // Applied until stable: `... CASCADE` and `... GRANTED BY x` can both trail.
+    let mut roles_part = roles_part.to_string();
+    loop {
+        let trimmed = p.grant_tail.replace(&roles_part, "").to_string();
+        if trimmed == roles_part {
+            break;
+        }
+        roles_part = trimmed;
+    }
+    let mut roles: Vec<String> = Vec::new();
+    for raw in split_top_level(&roles_part) {
+        let name = p.role_qualifier.replace(&raw, "").trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if let Some(rm) = p.role_name.captures(&name) {
+            roles.push(rm[1].to_string());
+        }
+    }
+
+    if objects.is_empty() || roles.is_empty() {
+        return None;
+    }
+    Some((collapse_ws(privileges_part).to_uppercase(), objects, roles))
 }
 
 struct Ctx<'a> {
@@ -262,6 +456,65 @@ impl<'a> Ctx<'a> {
             });
         }
         Ok(nid)
+    }
+
+    /// A SOURCELESS shared node for a database ROLE.
+    ///
+    /// Namespaced `sql_role_*` for the same reason tables are `sql_table_*`: a
+    /// role lives in the database, not in a file, so it must be ONE node across
+    /// the corpus and must stay out of the file-node id space.
+    ///
+    /// The label is `role <name>`, not the bare name, and that is load-bearing.
+    /// `_rewire_unique_stub_nodes` matches a sourceless stub onto a unique real
+    /// definition by LABEL KEY alone, so a role `anon` would be absorbed by a
+    /// table named `anon` -- turning `f --grants_to--> anon` into a claim about
+    /// a table, which is precisely the role/table confusion this change exists
+    /// to remove. `roleanon` and `anon` are different key spaces.
+    fn role_stub(&mut self, name: &str) -> R<String> {
+        // A quoted `'svc'` is one role with `svc`; `norm_ident` strips `"`,
+        // backticks and `[]` but not `'`.
+        let bytes = name.as_bytes();
+        let bare = if bytes.len() >= 2 && bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'' {
+            &name[1..name.len() - 1]
+        } else {
+            name
+        };
+        let role = norm_ident(bare);
+        let nid = self.mkid(&["sql", "role", &role])?;
+        if self.seen_ids.insert(nid.clone()) {
+            self.nodes.push(NodeRow {
+                id: nid.clone(),
+                fields: vec![
+                    ("label", Val::S(format!("role {role}"))),
+                    ("file_type", Val::Static("code")),
+                    ("source_file", Val::Static("")),
+                    ("source_location", Val::Static("")),
+                ],
+            });
+        }
+        Ok(nid)
+    }
+
+    /// `add_edge` plus a trailing `privileges` key.
+    ///
+    /// Which privileges, verbatim: the whole point of a grant edge is WHAT was
+    /// granted, since "never grant execute to anon" cannot be answered from a
+    /// bare object->role link. `privileges` is LAST, matching the Python, which
+    /// sets it after `weight`.
+    fn add_grant_edge(&mut self, src: &str, tgt: &str, relation: &'static str,
+                      line: usize, privileges: &str) {
+        self.edges.push(EdgeRow {
+            source: src.to_string(),
+            target: tgt.to_string(),
+            relation,
+            fields: vec![
+                ("confidence", Val::Static("EXTRACTED")),
+                ("source_file", Val::S(self.str_path.to_string())),
+                ("source_location", Val::S(format!("L{line}"))),
+                ("weight", Val::F(1.0)),
+                ("privileges", Val::S(privileges.to_string())),
+            ],
+        });
     }
 
     /// `table_nids.get(norm) or _ref_stub(name)`.
@@ -747,6 +1000,48 @@ fn extract<'py>(
             let fn_line = line_offset(src_text, m.get(0).unwrap().start()) + 1;
             let nid = ctx.mkid(&[&ctx.stem.clone(), &fn_name])?;
             ctx.add_node(&nid, &format!("{fn_name}()"), fn_line);
+        }
+    }
+
+    // ── GRANT / REVOKE ───────────────────────────────────────────────────────
+    // tree-sitter-sql has NO rule for these: the kind list holds `create_role`,
+    // `alter_role`, `drop_role` and nothing else. Every GRANT/REVOKE lands in an
+    // ERROR node (1,393 of 1,584 measured on postgres + sqlfluff), and recovery
+    // actively MANGLES them -- `GRANT SELECT ON t TO r` recovers as a real
+    // `select` statement with `ON t` as a term. So this scans text and ignores
+    // the tree, like the REFERENCES and routine fallbacks above.
+    //
+    // Line-anchored, which is what keeps commented-out DDL out: `-- GRANT ...`
+    // cannot match. Measured across both corpora, 0 of 1,421 line-start
+    // GRANT/REVOKEs sit inside a comment or a quoted string. One inside a
+    // multi-line `EXECUTE '...'` body would still be picked up; that is the
+    // known residual, recorded rather than guessed at.
+    for m in p.grant_stmt.captures_iter(src_text) {
+        let whole = m.get(0).unwrap();
+        let verb = m[1].to_uppercase();
+        let line = line_offset(src_text, whole.start()) + 1;
+        let Some((privileges, objects, roles)) = parse_grant(p, &verb, &m[2]) else {
+            continue;
+        };
+        let relation = if verb == "GRANT" { "grants_to" } else { "revokes_from" };
+        for obj in &objects {
+            let by_table = ctx.table_get(&norm_ident(obj)).map(str::to_string);
+            let obj_nid = match by_table {
+                Some(nid) => nid,
+                None => {
+                    let stem = ctx.stem.clone();
+                    let candidate = ctx.mkid(&[&stem, obj])?;
+                    if ctx.seen_ids.contains(&candidate) {
+                        candidate
+                    } else {
+                        ctx.ref_stub(obj)?
+                    }
+                }
+            };
+            for role in &roles {
+                let role_nid = ctx.role_stub(role)?;
+                ctx.add_grant_edge(&obj_nid, &role_nid, relation, line, &privileges);
+            }
         }
     }
 

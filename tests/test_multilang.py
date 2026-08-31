@@ -855,3 +855,88 @@ def test_sql_table_stub_id_cannot_collide_with_a_file_node(tmp_path):
     assert stub["id"] == "sql_table_pg_class"
     # The bare id — the one a `pg_class.h` file node would take — stays free.
     assert not any(n["id"] == "pg_class" for n in result["nodes"])
+
+
+def _grant_edges(result):
+    return [(e["source"].split("_m_")[-1], e["target"], e["relation"],
+             e.get("privileges")) for e in result["edges"]
+            if e["relation"] in ("grants_to", "revokes_from")]
+
+
+def test_sql_grant_and_revoke_are_distinct_relations(tmp_path):
+    """A REVOKE must never read as a dependency.
+
+    tree-sitter-sql has no grammar rule for GRANT/REVOKE at all -- they land in
+    ERROR nodes and error recovery mangles them -- so 1,421 grant statements
+    across the corpora produced ZERO edges. The privileges ride on the edge
+    because "never grant execute to anon" is unanswerable from a bare
+    object->role link.
+    """
+    pytest.importorskip("tree_sitter_sql")
+    (tmp_path / "m.sql").write_text(
+        "CREATE TABLE public.account (id uuid PRIMARY KEY);\n"
+        "GRANT SELECT, INSERT ON TABLE public.account TO anon;\n"
+        "REVOKE ALL ON TABLE public.account FROM anon;\n", encoding="utf-8")
+
+    edges = _grant_edges(extract_sql(tmp_path / "m.sql"))
+    assert ("public_account", "sql_role_anon", "grants_to", "SELECT, INSERT") in edges
+    assert ("public_account", "sql_role_anon", "revokes_from", "ALL") in edges
+    # The revoke is not a read, an import, or any other dependency.
+    assert not [e for e in extract_sql(tmp_path / "m.sql")["edges"]
+                if e["relation"] == "reads_from"]
+
+
+def test_sql_role_node_cannot_be_absorbed_by_a_same_named_table(tmp_path):
+    """`_rewire_unique_stub_nodes` matches sourceless stubs onto a unique real
+    definition by label key alone, so a role `anon` beside a table `anon` would
+    be absorbed -- turning `f --grants_to--> anon` into a claim about a table.
+    That is the exact role/table confusion this change removes, so the labels
+    live in different key spaces.
+    """
+    pytest.importorskip("tree_sitter_sql")
+    (tmp_path / "m.sql").write_text(
+        "CREATE TABLE anon (id int);\n"
+        "GRANT SELECT ON anon TO anon;\n", encoding="utf-8")
+
+    result = extract(sorted(tmp_path.glob("*.sql")), cache_root=tmp_path)
+    roles = [n for n in result["nodes"] if str(n["id"]).startswith("sql_role_")]
+    assert len(roles) == 1 and roles[0]["label"] == "role anon"
+    grant = next(e for e in result["edges"] if e["relation"] == "grants_to")
+    assert grant["target"] == roles[0]["id"]
+    assert grant["source"] != roles[0]["id"]
+
+
+@pytest.mark.parametrize("statement", [
+    "GRANT ALL ON SCHEMA public TO postgres;",       # not a graph entity
+    "GRANT ALL ON DATABASE mydb TO postgres;",       # not a graph entity
+    "GRANT admin TO alice;",                         # role membership, no ON
+    "GRANT ALL ON TYPE::dbo.SomeType TO r;",         # T-SQL non-object class
+    "GRANT INSERT ON db_name.* TO user_name;",       # MySQL wildcard
+    "-- GRANT SELECT ON t TO evil;",                 # commented out
+])
+def test_sql_grant_emits_nothing_rather_than_guessing(tmp_path, statement):
+    """Excluded loudly, not guessed at. A grant on a DATABASE has no object node
+    to point at, and a guessed target shipped as EXTRACTED at confidence 1.0 is
+    the failure this whole change exists to remove.
+    """
+    pytest.importorskip("tree_sitter_sql")
+    (tmp_path / "m.sql").write_text(
+        f"CREATE TABLE t (id int);\n{statement}\n", encoding="utf-8")
+    assert _grant_edges(extract_sql(tmp_path / "m.sql")) == []
+
+
+def test_sql_grant_parses_tsql_and_quoted_dialects(tmp_path):
+    """T-SQL spells REVOKE ... TO (not FROM) and trails `AS <grantor>`;
+    Databricks roles are backtick-quoted and may contain hyphens; MySQL names an
+    account `user@host`, of which only the user part is kept.
+    """
+    pytest.importorskip("tree_sitter_sql")
+    (tmp_path / "m.sql").write_text(
+        "REVOKE SELECT ON dbo.SomeTable TO SomeRole AS SomeAdmin;\n"
+        "GRANT SELECT ON t TO `finance-team`, 'svc'@'%';\n", encoding="utf-8")
+
+    edges = _grant_edges(extract_sql(tmp_path / "m.sql"))
+    assert ("sql_table_dbo_sometable", "sql_role_somerole",
+            "revokes_from", "SELECT") in edges
+    targets = {t for _, t, _, _ in edges}
+    assert {"sql_role_finance_team", "sql_role_svc"} <= targets

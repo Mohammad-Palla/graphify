@@ -8,6 +8,173 @@ from graphify.extractors import kernel as _kernel
 from graphify.extractors.base import _file_stem, _make_id
 
 
+# A GRANT/REVOKE statement, anchored at line start and running to the first `;`.
+# DOTALL because the statement routinely wraps across lines (a function signature
+# with several parameter types is the common case).
+_GRANT_STMT = re.compile(
+    r"^[ \t]*(GRANT|REVOKE)\b(?P<body>.*?);",
+    re.IGNORECASE | re.MULTILINE | re.DOTALL,
+)
+
+# Object types that ARE graph entities, and so can carry a grant edge. Postgres
+# defaults to TABLE when the keyword is omitted, which is why the keyword is
+# optional at the call site.
+_GRANTABLE_OBJECT_TYPES = (
+    "materialized view", "foreign table", "procedure", "function",
+    "sequence", "routine", "table", "view",
+)
+
+# Object types that are NOT graph entities. A grant on one of these is real SQL
+# and correctly parsed -- there is simply no node to hang it on, so nothing is
+# emitted rather than a stub being invented for a database or a schema.
+_UNGRAPHED_OBJECT_TYPES = (
+    "all tables in schema", "all sequences in schema", "all functions in schema",
+    "all procedures in schema", "all routines in schema",
+    "foreign data wrapper", "foreign server", "large object", "tablespace",
+    "database", "language", "parameter", "schema", "domain", "type",
+    # SQL/PGQ (Postgres 18). A real object, but not one this graph models.
+    "property graph",
+    # Databricks / Unity Catalog.
+    "external location", "storage credential", "metastore", "connection",
+    "catalog", "share", "provider", "recipient",
+)
+
+# Trailing clauses that are not part of the role list.
+# Applied repeatedly: `... CASCADE` and `... GRANTED BY x` can both be present.
+_GRANT_TAIL = re.compile(
+    r"\s+(?:WITH\s+(?:GRANT|ADMIN|INHERIT|SET)\s+OPTION"
+    r"|GRANTED\s+BY\s+[\w$\"`\[\]]+"   # Postgres
+    r"|AS\s+[\w$\"`\[\]]+"              # T-SQL grantor
+    r"|CASCADE|RESTRICT)\s*$",
+    re.IGNORECASE,
+)
+
+# A name part: bare, or delimited by "", ``, '' or []. Delimited parts may
+# contain anything but their delimiter -- a Databricks role is routinely
+# `finance-team`, whose hyphen no `\w` pattern will match.
+_PART = r"""(?:"[^"\n]+"|`[^`\n]+`|'[^'\n]+'|\[[^\]\n]+\]|[\w$]+)"""
+_OBJECT_NAME = re.compile(r"^" + _PART + r"(?:\s*\.\s*" + _PART + r")*$")
+# MySQL names an account `user@host` (`'svc'@'%'`). Only the user part is kept:
+# the id would collapse to the same slug either way (`_make_id` drops `@` and
+# `%`), so keeping the host would leave two labels fighting over one id.
+# Consequence, recorded rather than hidden: `svc@localhost` and `svc@%` are one
+# node, though MySQL treats them as different accounts.
+_ROLE_NAME = re.compile(r"^(" + _PART + r")(?:\s*@\s*" + _PART + r")?$")
+
+# T-SQL scopes the object by class: `OBJECT::t`, `TYPE::t`, `SCHEMA::s`. Only
+# OBJECT names something this graph holds.
+_TSQL_SECURABLE_CLASS = re.compile(r"^([A-Za-z_]+)\s*::\s*", re.IGNORECASE)
+# `REVOKE GRANT OPTION FOR <privs> ON ...`, and role-qualifier noise in a role list.
+_REVOKE_OPTION_FOR = re.compile(r"^\s*(?:GRANT|ADMIN)\s+OPTION\s+FOR\b", re.IGNORECASE)
+_ROLE_QUALIFIER = re.compile(r"^(?:GROUP|ROLE|USER)\s+", re.IGNORECASE)
+
+
+def _split_top_level(text: str) -> list[str]:
+    """Split on commas that are not inside parentheses.
+
+    A routine's argument list is comma-separated too, so a naive `split(",")`
+    tears `FUNCTION f(uuid, text), g(int)` into four objects instead of two.
+    """
+    parts: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    parts.append("".join(current))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _split_keyword(text: str, keyword: str) -> tuple[str, str] | None:
+    """Split at the first top-level occurrence of `keyword` as a whole word.
+
+    Top-level because a routine signature can contain the word inside its
+    parentheses, and the FIRST occurrence because the trailing clauses
+    (`WITH GRANT OPTION`) come after the role list, never before it.
+    """
+    depth = 0
+    for match in re.finditer(r"\b" + keyword + r"\b", text, re.IGNORECASE):
+        depth = (text.count("(", 0, match.start())
+                 - text.count(")", 0, match.start()))
+        if depth <= 0:
+            return text[: match.start()], text[match.end():]
+    return None
+
+
+def _parse_grant(verb: str, body: str) -> tuple[str, list[str], list[str]] | None:
+    """Split a GRANT/REVOKE body into (privileges, objects, roles).
+
+    Returns None when the statement is well-formed SQL that this graph has no
+    node for, so the caller emits nothing. That is deliberate: the failure this
+    replaces is a guessed edge presented as EXTRACTED at confidence 1.0, and a
+    grant on a DATABASE has no object node to point at.
+    """
+    body = _REVOKE_OPTION_FOR.sub("", body)
+    # No ON => role membership (`GRANT admin TO alice`). Both sides are roles,
+    # so there is no object to hang a privilege edge on.
+    split_on = _split_keyword(body, "ON")
+    if split_on is None:
+        return None
+    privileges_part, rest = split_on
+
+    # Postgres spells it `REVOKE ... FROM role`; T-SQL spells it
+    # `REVOKE ... TO role`. Try the dialect-native keyword first, then the other
+    # -- 25 of the corpus statements are T-SQL and were dropped by FROM alone.
+    split_roles = _split_keyword(rest, "TO" if verb == "GRANT" else "FROM")
+    if split_roles is None and verb == "REVOKE":
+        split_roles = _split_keyword(rest, "TO")
+    if split_roles is None:
+        return None
+    objects_part, roles_part = split_roles
+
+    objects_part = objects_part.strip()
+    class_match = _TSQL_SECURABLE_CLASS.match(objects_part)
+    if class_match:
+        if class_match.group(1).lower() != "object":
+            return None  # TYPE::, SCHEMA::, ASSEMBLY:: -- not graph entities
+        objects_part = objects_part[class_match.end():].strip()
+    lowered = objects_part.lower()
+    if lowered.startswith(_UNGRAPHED_OBJECT_TYPES):
+        return None
+    for object_type in _GRANTABLE_OBJECT_TYPES:
+        if lowered.startswith(object_type + " ") or lowered.startswith(object_type + "\n"):
+            objects_part = objects_part[len(object_type):].strip()
+            break
+
+    objects = []
+    for raw in _split_top_level(objects_part):
+        # Drop a routine's argument list: the node is keyed on the name.
+        name = re.sub(r"\s*\(.*\)\s*$", "", raw, flags=re.DOTALL).strip()
+        # `GRANT ... ON db_name.* TO x` (MySQL) names a whole database, not an
+        # object, so there is nothing to point an edge at.
+        if name and not name.endswith(".*") and _OBJECT_NAME.match(name):
+            objects.append(name)
+
+    roles = []
+    while True:
+        trimmed = _GRANT_TAIL.sub("", roles_part)
+        if trimmed == roles_part:
+            break
+        roles_part = trimmed
+    for raw in _split_top_level(roles_part):
+        name = _ROLE_QUALIFIER.sub("", raw).strip()
+        role_match = _ROLE_NAME.match(name) if name else None
+        if role_match:
+            roles.append(role_match.group(1))
+
+    if not objects or not roles:
+        return None
+    privileges = " ".join(privileges_part.split()).upper()
+    return privileges, objects, roles
+
+
 def _norm_ident(name: str) -> str:
     """Normalize a SQL identifier for name-based reference resolution.
 
@@ -100,10 +267,48 @@ def extract_sql(path: Path, content: str | bytes | None = None) -> dict:
                            "confidence": "EXTRACTED", "source_file": str_path,
                            "source_location": f"L{line}", "weight": 1.0})
 
-    def _add_edge(src: str, tgt: str, relation: str, line: int) -> None:
-        edges.append({"source": src, "target": tgt, "relation": relation,
-                       "confidence": "EXTRACTED", "source_file": str_path,
-                       "source_location": f"L{line}", "weight": 1.0})
+    def _add_edge(src: str, tgt: str, relation: str, line: int,
+                  privileges: str | None = None) -> None:
+        edge = {"source": src, "target": tgt, "relation": relation,
+                "confidence": "EXTRACTED", "source_file": str_path,
+                "source_location": f"L{line}", "weight": 1.0}
+        if privileges is not None:
+            # Which privileges, verbatim from the statement. The whole point of
+            # a grant edge is WHAT was granted: "never grant execute to anon" is
+            # unanswerable from a bare role->object link.
+            edge["privileges"] = privileges
+        edges.append(edge)
+
+    def _role_stub(name: str) -> str:
+        """Sourceless shared node for a database ROLE.
+
+        Namespaced `sql_role_*` for the same reason table stubs are namespaced
+        `sql_table_*`: a role lives in the database, not in a file, so it must be
+        one node across the corpus, and it must not land in the id space of file
+        nodes.
+
+        The label is `role <name>`, not the bare name, and that is load-bearing
+        rather than cosmetic. `_rewire_unique_stub_nodes` matches a sourceless
+        stub onto a unique real definition purely by label key, so a role `anon`
+        would be ABSORBED by a table named `anon` -- turning
+        `f --grants_to--> anon` into a statement about a table. That is exactly
+        the role/table confusion this whole change exists to remove, so the
+        labels are kept in different key spaces (`roleanon` vs `anon`).
+        """
+        # Normalised like a table key: `"public"`, `PUBLIC` and `public` are one
+        # role. Strictly, a quoted role name is case-sensitive and `"Public"` is
+        # a different role from `public` -- but folding them keeps one node for
+        # the overwhelmingly common case, and splitting on quoting style would
+        # scatter the very node an audit query goes looking for.
+        if len(name) >= 2 and name[0] == name[-1] == "'":
+            name = name[1:-1]
+        role = _norm_ident(name)
+        nid = _make_id("sql", "role", role)
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({"id": nid, "label": f"role {role}", "file_type": "code",
+                           "source_file": "", "source_location": ""})
+        return nid
 
     def _ref_stub(name: str) -> str:
         """Sourceless bare-name stub for a table referenced but not defined here.
@@ -500,5 +705,46 @@ def extract_sql(path: Path, content: str | bytes | None = None) -> dict:
             fn_name = m.group(1)
             fn_line = src_text[: m.start()].count("\n") + 1
             _add_node(_make_id(stem, fn_name), f"{fn_name}()", fn_line)
+
+    # ── GRANT / REVOKE ────────────────────────────────────────────────────────
+    # tree-sitter-sql has NO grammar rule for these. The kind list contains
+    # `create_role`/`alter_role`/`drop_role` and nothing else: every GRANT and
+    # REVOKE lands in an ERROR node (1,393 of 1,584 measured on postgres +
+    # sqlfluff), and error recovery actively MANGLES them --
+    # `GRANT SELECT ON t TO r` recovers as a real `select` statement with `ON t`
+    # as a term. So this is a whole-file text scan, like the REFERENCES and
+    # routine fallbacks above, and it deliberately ignores the tree.
+    #
+    # Before this, 1,421 GRANT/REVOKE statements across both corpora produced
+    # ZERO edges -- a silent gap in the area where a wrong answer costs most
+    # ("never grant execute to anon" is a rule people enforce in CI).
+    #
+    # Anchored at line start, which is what keeps commented-out and
+    # string-embedded DDL out: `-- GRANT ...` cannot match. Measured across both
+    # corpora, 0 of 1,421 line-start GRANT/REVOKEs sit inside a comment or a
+    # quoted string. A grant inside a multi-line `EXECUTE '...'` body would
+    # still be picked up; that is the known residual exposure, and it is
+    # recorded rather than guessed at.
+    for m in _GRANT_STMT.finditer(src_text):
+        verb = m.group(1).upper()
+        line = src_text[: m.start()].count("\n") + 1
+        parsed = _parse_grant(verb, m.group("body"))
+        if parsed is None:
+            # Not a privilege grant on a nameable object: role membership
+            # (`GRANT admin TO alice`, no ON), or an object type that is not a
+            # graph entity (SCHEMA, DATABASE, LANGUAGE, ALL TABLES IN SCHEMA).
+            # Emitting nothing is the point -- a guessed target here is worse
+            # than no edge.
+            continue
+        privileges, objects, roles = parsed
+        relation = "grants_to" if verb == "GRANT" else "revokes_from"
+        for obj in objects:
+            obj_nid = (table_nids.get(_norm_ident(obj))
+                       or (_make_id(stem, obj) if _make_id(stem, obj) in seen_ids
+                           else None)
+                       or _ref_stub(obj))
+            for role in roles:
+                _add_edge(obj_nid, _role_stub(role), relation, line,
+                          privileges=privileges)
 
     return {"nodes": nodes, "edges": edges}
