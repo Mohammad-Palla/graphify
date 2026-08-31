@@ -805,3 +805,53 @@ def test_sql_quoted_plpgsql_file_stays_clean():
     contains_targets = {e["target"] for e in r["edges"] if e["relation"] == "contains"}
     fn_ids = {n["id"] for n in r["nodes"] if n["label"].endswith("()")}
     assert fn_ids <= contains_targets
+
+
+def test_sql_cross_file_table_reference_is_one_shared_stub(tmp_path):
+    """A table referenced from N files must be ONE node, not N file-salted copies.
+
+    `_ref_stub` mints a sourceless stub so `_rewire_unique_stub_nodes` can collapse
+    it onto the real definition at corpus level. It used to also stamp
+    `origin_file`, which is the key `_disambiguate_colliding_node_ids` falls back
+    to for a sourceless node — so the stub was salted with the REFERENCING file's
+    path, and since disambiguation runs BEFORE the rewire, the rewire had nothing
+    left to collapse. Measured on 20 migrations referencing one table created
+    once: 28 nodes for `public.account`.
+    """
+    pytest.importorskip("tree_sitter_sql")
+    mig = tmp_path / "migrations"
+    mig.mkdir()
+    (mig / "0001_init.sql").write_text(
+        "CREATE TABLE public.account (id uuid PRIMARY KEY);\n", encoding="utf-8")
+    for i in range(2, 8):
+        (mig / f"000{i}_m{i}.sql").write_text(
+            f"CREATE VIEW v{i} AS SELECT id FROM public.account;\n", encoding="utf-8")
+
+    result = extract(sorted(mig.glob("*.sql")), cache_root=tmp_path)
+    stubs = {n["id"] for n in result["nodes"]
+             if n["label"] == "public.account" and not n.get("source_file")}
+    assert len(stubs) == 1, sorted(stubs)
+    # ...and the referencing file's path is not baked into it.
+    assert not any("_m" in s for s in stubs), sorted(stubs)
+
+
+def test_sql_table_stub_id_cannot_collide_with_a_file_node(tmp_path):
+    """The stub id is namespaced `sql_table_*`, like Go's `go_type_*`.
+
+    A bare `_make_id(name)` puts the stub in the same id space as FILE nodes.
+    Postgres has both a table `pg_class` and `src/include/catalog/pg_class.h`,
+    whose file node also reduces to `pg_class`; disambiguation salts the
+    colliding FILE apart but skips a node with no source key, so the stub kept
+    the bare id and absorbed the `#include` edges aimed at the header — 454 C
+    imports silently retargeted onto a SQL table, measured on postgres.
+    """
+    pytest.importorskip("tree_sitter_sql")
+    (tmp_path / "q.sql").write_text(
+        "CREATE VIEW v AS SELECT id FROM pg_class;\n", encoding="utf-8")
+
+    result = extract_sql(tmp_path / "q.sql")
+    stub = next(n for n in result["nodes"]
+                if n["label"] == "pg_class" and not n.get("source_file"))
+    assert stub["id"] == "sql_table_pg_class"
+    # The bare id — the one a `pg_class.h` file node would take — stays free.
+    assert not any(n["id"] == "pg_class" for n in result["nodes"])

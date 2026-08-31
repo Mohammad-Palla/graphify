@@ -119,13 +119,45 @@ def extract_sql(path: Path, content: str | bytes | None = None) -> dict:
         as a portable name-only node instead of dangling. No contains edge: a
         sourced/contained stub would get the referencing file's path baked into
         its id by disambiguation, blocking the rewire.
+
+        No ``origin_file`` either, for the same reason and by the same route.
+        That hint is what ``_disambiguate_colliding_node_ids`` falls back to for
+        a SOURCELESS node, so stamping it re-introduced exactly the compound id
+        this stub exists to avoid. Disambiguation runs BEFORE
+        ``_rewire_unique_stub_nodes``, so the rewire was left with nothing to
+        collapse: measured on 20 migrations referencing one table created once,
+        ``public.account`` became 28 nodes.
+
+        Omitting it is the deliberate #1462 opt-out, not an oversight. #1462
+        keeps sourceless stubs per-file distinct only where Graphify cannot tell
+        whether two same-named references mean the same external entity (two
+        files importing ``pathlib.Path``). SQL is the case where it can: a table
+        name is resolved by the database globally, never per-file, so two
+        references to ``public.account`` are the same table by definition. Go
+        states the same fact with a canonical ``go_type_*`` id; SQL has no such
+        pass, and withholding the hint is the equivalent statement.
+
+        Sharing a stub is not binding it: ``_rewire_unique_stub_nodes`` still
+        absorbs one only when EXACTLY ONE real definition carries the name, so an
+        ambiguous name survives as a single shared name-only node rather than
+        mis-binding to an arbitrary definition.
+
+        The id is NAMESPACED (`sql_table_*`), exactly as Go namespaces its shared
+        external types `go_type_*`, and for a reason found by measurement rather
+        than taste. A bare `_make_id(name)` puts the stub in the same id space as
+        FILE nodes: Postgres has both a table `pg_class` and a header
+        `src/include/catalog/pg_class.h`, whose file node also reduces to
+        `pg_class`. Disambiguation salts the colliding FILE apart but skips a
+        node with no source_key, so the stub kept the bare `pg_class` and then
+        absorbed the `#include "catalog/pg_class.h"` edges aimed at the header:
+        **454 C imports silently retargeted onto a SQL table** on postgres alone.
+        Namespacing removes the collision instead of arbitrating it.
         """
-        nid = _make_id(name)
+        nid = _make_id("sql", "table", name)
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({"id": nid, "label": name, "file_type": "code",
-                           "source_file": "", "source_location": "",
-                           "origin_file": str_path})
+                           "source_file": "", "source_location": ""})
         return nid
 
     def walk(node) -> None:

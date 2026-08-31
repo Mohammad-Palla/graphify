@@ -232,8 +232,24 @@ impl<'a> Ctx<'a> {
     /// SQL references are NAME-based, so a table created in another migration can
     /// only resolve at corpus level. NO `contains` edge, deliberately -- see the
     /// module doc.
+    ///
+    /// And NO `origin_file`, which every other stub-emitting walker here does
+    /// set. That is not an omission: `_disambiguate_colliding_node_ids` falls
+    /// back to `origin_file` for a node with no `source_file`, so stamping it
+    /// salted this stub with the REFERENCING file's path and split one table
+    /// across every migration that mentioned it -- 28 nodes for one table
+    /// created once, measured. Withholding it is how a walker states "file is
+    /// not part of this name's identity"; a SQL table name is resolved by the
+    /// database globally. Keep this in step with `_ref_stub` in
+    /// `graphify/extractors/sql.py`: the key set here IS the parity contract.
+    ///
+    /// The id is NAMESPACED `sql_table_*`, mirroring Go's `go_type_*`. A bare id
+    /// shares an id space with FILE nodes -- Postgres has a table `pg_class` AND
+    /// a `pg_class.h` whose file node also reduces to `pg_class` -- and the
+    /// sourceless stub then absorbed the `#include` edges meant for the header:
+    /// 454 C imports silently retargeted onto a SQL table, measured on postgres.
     fn ref_stub(&mut self, name: &str) -> R<String> {
-        let nid = self.mkid(&[name])?;
+        let nid = self.mkid(&["sql", "table", name])?;
         if self.seen_ids.insert(nid.clone()) {
             self.nodes.push(NodeRow {
                 id: nid.clone(),
@@ -242,7 +258,6 @@ impl<'a> Ctx<'a> {
                     ("file_type", Val::Static("code")),
                     ("source_file", Val::Static("")),
                     ("source_location", Val::Static("")),
-                    ("origin_file", Val::S(self.str_path.to_string())),
                 ],
             });
         }
