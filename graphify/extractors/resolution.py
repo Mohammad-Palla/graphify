@@ -826,7 +826,24 @@ def _disambiguate_colliding_node_ids(
         elif raw_call.get("caller_nid") in unambiguous_remaps:
             raw_call["caller_nid"] = unambiguous_remaps[str(raw_call["caller_nid"])]
 
-def _is_type_like_definition(node: dict) -> bool:
+def _is_type_like_definition(node: dict, *, allow_qualified: bool = False) -> bool:
+    """Is this node a bare type-like DEFINITION?
+
+    `allow_qualified` defaults to False, and that default is what every
+    receiver-typed member-call resolver relies on. Those passes
+    (`_resolve_typescript_member_calls` and its Swift/C++/C#/Java/ObjC/Go
+    siblings) build "type NAME -> definition" maps and match a receiver's type
+    against them; a dotted label there is a qualified reference or a member
+    (`Foo.bar`), never a bare type name, so admitting one would let a receiver
+    bind to a member of something else.
+
+    `_rewire_unique_stub_nodes` is the one caller that passes True, for a
+    separate map keyed on the EXACT label. A SQL table is legitimately named
+    `public.account`, and excluding it meant a schema-qualified reference could
+    never rewire onto its own definition: measured on a migrations-shaped repo,
+    `public.booking` was two nodes, one holding 28 edges with no source location
+    and the other holding the source location with 2 edges.
+    """
     if node.get("type") == "namespace":
         return False
     label = str(node.get("label", "")).strip()
@@ -834,7 +851,7 @@ def _is_type_like_definition(node: dict) -> bool:
         return False
     if label.endswith(")") or label.startswith("."):
         return False
-    if "." in label:
+    if "." in label and not allow_qualified:
         return False
     return node.get("file_type") == "code"
 

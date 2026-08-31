@@ -4218,3 +4218,34 @@ def test_extract_genuinely_empty_json_still_failed(tmp_path, monkeypatch):
     p.write_text("{}\n")
     result = _ex.extract([p], cache_root=tmp_path)
     assert [Path(x).name for x in result.get("failed_sources", [])] == ["meta.json"]
+
+
+def test_qualified_stub_does_not_absorb_a_camelcase_local_type(tmp_path):
+    """`pkg.Type` must not rewire onto a private `pkgType` in some other file.
+
+    `_node_label_key` strips every non-alphanumeric, so `testing.TB` and
+    `testingTB` hashed to one key and a qualified external reference was
+    absorbed by an unrelated unexported local type. Measured on go-k8s: eight
+    Go stdlib types were merged this way, moving 166 edges onto local
+    look-alikes — `testing.TB` alone contributed 103 of them to a private
+    interface in `test/utils/ktesting/tcontext.go`, which then ranked as a
+    degree-106 hub built almost entirely out of misresolved references.
+    """
+    local = tmp_path / "a" / "local.go"
+    user = tmp_path / "b" / "user.go"
+    local.parent.mkdir(parents=True)
+    user.parent.mkdir(parents=True)
+    local.write_text("package a\n\ntype extWidget struct{}\n", encoding="utf-8")
+    user.write_text('package b\n\nimport "ext"\n\nfunc UseB(w ext.Widget) {}\n',
+                    encoding="utf-8")
+
+    result = extract([local, user], cache_root=tmp_path)
+    local_nid = next(n["id"] for n in result["nodes"] if n["label"] == "extWidget")
+    qualified = [n for n in result["nodes"] if n["label"] == "ext.Widget"]
+    # The external type survives as its own node...
+    assert qualified, [n["label"] for n in result["nodes"]]
+    assert qualified[0]["id"] != local_nid
+    # ...and nothing points the qualified reference at the local look-alike.
+    assert not [e for e in result["edges"]
+                if e["target"] == local_nid and e["source"] != local_nid
+                and not str(e.get("source_file", "")).endswith("local.go")]

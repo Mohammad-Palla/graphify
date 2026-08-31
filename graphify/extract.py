@@ -2546,13 +2546,32 @@ def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
     real_by_label: dict[str, list[dict]] = {}       # exact-case type-like (all languages)
     real_by_label_ci: dict[str, list[dict]] = {}    # case-INSENSITIVE-language reals only
     func_by_label: dict[str, list[dict]] = {}       # top-level function defs (#1781)
+    # QUALIFIED defs, keyed on the EXACT label rather than `_node_label_key`.
+    # A SQL table really is named `public.account`, and `_is_type_like_definition`
+    # rejects any dotted label, so such a definition could never be a rewire
+    # target and a schema-qualified reference stayed forever separate from it.
+    # The exact label is the key on purpose: `_node_label_key` strips every
+    # non-alphanumeric, so keying `public.account` through it would make it
+    # collide with a node literally labelled `publicaccount`.
+    qualified_by_label: dict[str, list[dict]] = {}
     stubs: list[dict] = []
+
+    # A definition is the target of a `contains` edge from its file node. A bare
+    # REFERENCE can create a same-label shadow node that carries a source_file but
+    # is not contained (the member-call resolvers exclude those for the same
+    # reason), so requiring containment keeps a shadow from absorbing a stub.
+    contained_ids = {edge.get("target") for edge in edges
+                     if edge.get("relation") == "contains"}
 
     for node in nodes:
         key = _node_label_key(node)
         if not key:
             continue
         if node.get("source_file"):
+            label = str(node.get("label", "")).strip()
+            if ("." in label and node.get("id") in contained_ids
+                    and _is_type_like_definition(node, allow_qualified=True)):
+                qualified_by_label.setdefault(label, []).append(node)
             if _is_type_like_definition(node):
                 # Match stubs case-SENSITIVELY: a `Path` reference must not rewire to a
                 # `PATH` env var (#1581). Fold only for genuinely case-insensitive
@@ -2594,22 +2613,45 @@ def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
         stub_id = str(stub.get("id", ""))
         if not stub_id:
             continue
-        candidates = real_by_label.get(_node_label_key(stub), [])
-        if len(candidates) != 1:
-            # No unique exact type match — fall back to a case-insensitive match, but
-            # only against case-insensitive-language definitions (so a case-sensitive
-            # `PATH` can never absorb a `Path` reference).
-            candidates = real_by_label_ci.get(_node_label_key(stub, fold=True), [])
-        if len(candidates) != 1:
-            # #1781: no unique type — try a unique top-level FUNCTION definition,
-            # gated by (a) the stub not being used as a supertype and (b) a
-            # language-family match with the stub's referrers.
-            fcands = func_by_label.get(_node_label_key(stub), [])
-            if len(fcands) == 1 and stub_id not in supertype_stub_ids:
+        stub_label = str(stub.get("label", "")).strip()
+        if "." in stub_label:
+            # A QUALIFIED stub matches only another qualified name, and only on
+            # the EXACT label. It must never go through the three maps below,
+            # which are keyed on `_node_label_key` — that strips every
+            # non-alphanumeric, so `public.account` and `publicaccount` collapse
+            # to one key. Measured before this change: a view whose source says
+            # `FROM public.account` was given a `reads_from` edge to an unrelated
+            # table named `publicaccount`, confidence EXTRACTED. A dotted name is
+            # structurally a different thing from the same characters without the
+            # dot, not a spelling variant of it.
+            #
+            # Family-gated like the function path (#1781): a dotted label is far
+            # likelier to mean different things in two languages than a bare type
+            # name is, so a Python `Class.method` must not absorb a SQL one.
+            candidates = []
+            qcands = qualified_by_label.get(stub_label, [])
+            if len(qcands) == 1:
                 fams = stub_families.get(stub_id, set())
-                cand_fam = _lang_family(fcands[0].get("source_file"))
+                cand_fam = _lang_family(qcands[0].get("source_file"))
                 if not fams or cand_fam is None or cand_fam in fams:
-                    candidates = fcands
+                    candidates = qcands
+        else:
+            candidates = real_by_label.get(_node_label_key(stub), [])
+            if len(candidates) != 1:
+                # No unique exact type match — fall back to a case-insensitive match, but
+                # only against case-insensitive-language definitions (so a case-sensitive
+                # `PATH` can never absorb a `Path` reference).
+                candidates = real_by_label_ci.get(_node_label_key(stub, fold=True), [])
+            if len(candidates) != 1:
+                # #1781: no unique type — try a unique top-level FUNCTION definition,
+                # gated by (a) the stub not being used as a supertype and (b) a
+                # language-family match with the stub's referrers.
+                fcands = func_by_label.get(_node_label_key(stub), [])
+                if len(fcands) == 1 and stub_id not in supertype_stub_ids:
+                    fams = stub_families.get(stub_id, set())
+                    cand_fam = _lang_family(fcands[0].get("source_file"))
+                    if not fams or cand_fam is None or cand_fam in fams:
+                        candidates = fcands
         if len(candidates) != 1:
             continue
         target_id = candidates[0].get("id")

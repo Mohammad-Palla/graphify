@@ -828,11 +828,14 @@ def test_sql_cross_file_table_reference_is_one_shared_stub(tmp_path):
             f"CREATE VIEW v{i} AS SELECT id FROM public.account;\n", encoding="utf-8")
 
     result = extract(sorted(mig.glob("*.sql")), cache_root=tmp_path)
-    stubs = {n["id"] for n in result["nodes"]
-             if n["label"] == "public.account" and not n.get("source_file")}
-    assert len(stubs) == 1, sorted(stubs)
-    # ...and the referencing file's path is not baked into it.
-    assert not any("_m" in s for s in stubs), sorted(stubs)
+    account = [n for n in result["nodes"] if n["label"] == "public.account"]
+    # ONE node, not one per referencing file -- and not two either: the shared
+    # stub now rewires onto the definition, so the surviving node is the real
+    # one, carrying the file and line the table was created at.
+    assert len({n["id"] for n in account}) == 1, sorted(n["id"] for n in account)
+    assert account[0]["source_file"].endswith("0001_init.sql"), account[0]
+    # The referencing file's path is not baked into the id.
+    assert "_m" not in account[0]["id"], account[0]["id"]
 
 
 def test_sql_table_stub_id_cannot_collide_with_a_file_node(tmp_path):
@@ -1051,3 +1054,56 @@ def test_sql_policy_id_is_namespaced_by_its_table(tmp_path):
     assert len(policies) == 2, policies
     # ...and neither is the table.
     assert table_foo not in policies
+
+
+def test_sql_qualified_reference_rewires_onto_its_own_definition(tmp_path):
+    """`_is_type_like_definition` rejects ANY dotted label, so a schema-qualified
+    table could never be a rewire target and its references stayed on a separate
+    sourceless node forever.
+
+    Measured on a migrations-shaped repo: `public.booking` was two nodes -- one
+    holding 28 edges with no source location, the other holding the source
+    location with 2 edges. Centrality then ranks the schema's core table below
+    a theme file, and `god-nodes` is the feature most affected.
+    """
+    pytest.importorskip("tree_sitter_sql")
+    mig = tmp_path / "migrations"
+    mig.mkdir()
+    (mig / "0001_init.sql").write_text(
+        "CREATE TABLE public.booking (id uuid PRIMARY KEY);\n", encoding="utf-8")
+    for i in range(2, 8):
+        (mig / f"000{i}_m{i}.sql").write_text(
+            f"CREATE VIEW public.v{i} AS SELECT id FROM public.booking;\n",
+            encoding="utf-8")
+
+    result = extract(sorted(mig.glob("*.sql")), cache_root=tmp_path)
+    booking = [n for n in result["nodes"] if n["label"] == "public.booking"]
+    assert len({n["id"] for n in booking}) == 1, sorted(n["id"] for n in booking)
+    # The survivor is the DEFINITION, so the merged node keeps a source location.
+    assert booking[0]["source_file"].endswith("0001_init.sql")
+    # ...and every reference now points at it.
+    reads = [e for e in result["edges"] if e["relation"] == "reads_from"]
+    assert reads and all(e["target"] == booking[0]["id"] for e in reads)
+
+
+def test_qualified_rewire_requires_an_exact_label_match(tmp_path):
+    """The qualified map is keyed on the EXACT label, not `_node_label_key`.
+
+    `_node_label_key` strips every non-alphanumeric, so keying `public.account`
+    through it would make it collide with a node literally labelled
+    `publicaccount` -- a merge across two unrelated objects.
+    """
+    pytest.importorskip("tree_sitter_sql")
+    mig = tmp_path / "migrations"
+    mig.mkdir()
+    (mig / "0001_init.sql").write_text(
+        'CREATE TABLE publicaccount (id uuid PRIMARY KEY);\n', encoding="utf-8")
+    (mig / "0002_use.sql").write_text(
+        "CREATE VIEW v AS SELECT id FROM public.account;\n", encoding="utf-8")
+
+    result = extract(sorted(mig.glob("*.sql")), cache_root=tmp_path)
+    labels = {n["label"] for n in result["nodes"]}
+    assert {"publicaccount", "public.account"} <= labels
+    ids = {n["label"]: n["id"] for n in result["nodes"]
+           if n["label"] in ("publicaccount", "public.account")}
+    assert ids["publicaccount"] != ids["public.account"]
