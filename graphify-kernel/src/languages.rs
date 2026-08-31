@@ -90,7 +90,25 @@ pub type Walker = for<'py> fn(
 /// elixir   elixir          568  100.0%      0.0%          0
 /// phoenix  elixir          177  100.0%      0.0%          0
 /// ecto     elixir          126  100.0%      0.0%          0
+/// dune     ocaml           400  100.0%      0.0%          0
+/// ocaml    ocaml           900   97.7%      2.3%          0
+/// ocaml    ocaml_iface     400   98.8%      1.2%          0
+/// flux     julia            96   93.8%      6.2%          0
+/// dataframes julia          73   95.9%      4.1%          0
+/// julia    julia           937   77.4%     22.6%          0
+/// stdlib   fortran         416   99.8%      0.2%          0
+/// json-fortran fortran      61   54.1%     45.9%          0
+/// lapack   fortran         500    0.2%     99.8%          0
 /// ```
+///
+/// **Read Fortran's three rows together or not at all.** The aggregate ceiling
+/// over those corpora is 12.5% and it is meaningless: split by EXTENSION, `.f90`
+/// free-form is 99.6% clean over 509 files and `.f` fixed-form FORTRAN 77 is
+/// 0.0% over 3,581 -- the grammar cannot parse fixed form at all, and LAPACK is
+/// 3,581 fixed-form files. Rejecting Fortran on the aggregate would have been
+/// rejecting it on a corpus-selection artefact. json-fortran sits in between
+/// because it is capital-`.F90`, so it is C-preprocessed first and the expansion
+/// introduces constructs the grammar rejects.
 ///
 /// Scala is the only language ported here with NO parse-error floor: 400/400
 /// sampled files parse clean on cats and akka. Its 4.4% deferral on cats is
@@ -184,7 +202,8 @@ pub fn supported() -> Vec<&'static str> {
     vec![
         "typescript", "tsx", "javascript", "python", "java", "csharp", "c", "cpp",
         "php", "bash", "go", "rust", "ruby", "kotlin", "lua", "scala",
-        "swift", "zig", "elixir", "ocaml", "ocaml_interface",
+        "swift", "zig", "elixir", "ocaml", "ocaml_interface", "julia",
+        "fortran",
     ]
 }
 
@@ -221,6 +240,8 @@ pub fn walker_for(language: &str) -> Option<Walker> {
         "swift" => Some(crate::swift::walk_swift),
         "zig" => Some(crate::zig::walk_zig),
         "elixir" => Some(crate::elixir::walk_elixir),
+        "fortran" => Some(crate::fortran::walk_fortran),
+        "julia" => Some(crate::julia::walk_julia),
         "ocaml" => Some(crate::ocaml::walk_ocaml),
         "ocaml_interface" => Some(crate::ocaml::walk_ocaml_interface),
         _ => None,
@@ -248,7 +269,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
 /// The node-kind and field counts change with essentially any grammar revision,
 /// which is what makes the triple a usable proxy for "same grammar".
 pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
-    let langs: [(&'static str, tree_sitter::Language); 22] = [
+    let langs: [(&'static str, tree_sitter::Language); 24] = [
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ("javascript", tree_sitter_javascript::LANGUAGE.into()),
@@ -269,6 +290,8 @@ pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
         ("swift", tree_sitter_swift::LANGUAGE.into()),
         ("zig", tree_sitter_zig::LANGUAGE.into()),
         ("elixir", tree_sitter_elixir::LANGUAGE.into()),
+        ("julia", tree_sitter_julia::LANGUAGE.into()),
+        ("fortran", tree_sitter_fortran::LANGUAGE.into()),
         ("ocaml", tree_sitter_ocaml::LANGUAGE_OCAML.into()),
         ("ocaml_interface", tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE.into()),
     ];

@@ -1,13 +1,20 @@
 """julia — moved verbatim from graphify/extract.py."""
 from __future__ import annotations
 
+from graphify.extractors import kernel as _kernel
 from graphify.extractors.base import _file_stem, _make_id, _read_text
 from graphify.extractors.engine import _semantic_reference_edge
 from pathlib import Path
 
 
+_KERNEL_GRAMMAR = _kernel.BespokeGrammar("tree_sitter_julia")
+
+
 def extract_julia(path: Path) -> dict:
     """Extract modules, structs, functions, imports, and calls from a .jl file."""
+    native = _kernel.try_extract(path, _KERNEL_GRAMMAR)
+    if native is not None:
+        return native
     try:
         import tree_sitter_julia as tsjulia
         from tree_sitter import Language, Parser

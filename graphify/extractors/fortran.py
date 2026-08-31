@@ -3,6 +3,7 @@ from __future__ import annotations
 
 
 from pathlib import Path
+from graphify.extractors import kernel as _kernel
 from graphify.extractors.base import _file_stem, _make_id, _read_text
 
 
@@ -43,12 +44,30 @@ def _cpp_preprocess(path: Path) -> bytes:
         pass
     return path.read_bytes()
 
+_KERNEL_GRAMMAR = _kernel.BespokeGrammar("tree_sitter_fortran")
+
+
 def extract_fortran(path: Path) -> dict:
     """Extract programs, modules, subroutines, functions, use statements, and calls from Fortran files.
 
     Capital-F extensions (.F, .F90, etc.) are run through the C preprocessor before
     parsing so #ifdef/#define macros are resolved.
     """
+    # The source bytes are computed BEFORE the kernel attempt and handed over as
+    # `source_override`, because a capital-F extension needs `cpp` expansion and
+    # the kernel neither can nor should spawn a subprocess. This way the native
+    # walker sees exactly the bytes this function would have parsed, and `cpp`
+    # runs at most once whichever arm wins.
+    try:
+        source = (_cpp_preprocess(path) if path.suffix in _FORTRAN_CPP_EXTS
+                  else path.read_bytes())
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    native = _kernel.try_extract(path, _KERNEL_GRAMMAR, source_override=source)
+    if native is not None:
+        return native
+
     try:
         import tree_sitter_fortran as tsfortran
         from tree_sitter import Language, Parser
@@ -58,7 +77,6 @@ def extract_fortran(path: Path) -> dict:
     try:
         language = Language(tsfortran.language())
         parser = Parser(language)
-        source = _cpp_preprocess(path) if path.suffix in _FORTRAN_CPP_EXTS else path.read_bytes()
         tree = parser.parse(source)
         root = tree.root_node
     except Exception as e:

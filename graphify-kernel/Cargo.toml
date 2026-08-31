@@ -47,6 +47,10 @@ tree-sitter-elixir = "0.3.5"
 # Bespoke walker, TWO grammars (LANGUAGE_OCAML / LANGUAGE_OCAML_INTERFACE).
 # Crate and PyPI package are both 0.25.0.
 tree-sitter-ocaml = "0.25.0"
+# Bespoke walker. Crate and PyPI package are both 0.23.1.
+tree-sitter-julia = "0.23.1"
+# Bespoke walker. Crate and PyPI package are both 0.6.0.
+tree-sitter-fortran = "0.6.0"
 # `_csharp_namespace_id` is `sha1(dotted_name).hexdigest()[:16]`, so the digest
 # is part of the node id and has to be the real thing.
 sha1 = "0.10"

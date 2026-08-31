@@ -41,6 +41,8 @@ mod php;
 mod ruby;
 mod scala;
 mod elixir;
+mod fortran;
+mod julia;
 mod ocaml;
 mod swift;
 mod zig;
