@@ -82,6 +82,48 @@ _SAMPLE_QUESTIONS = [
 ]
 
 
+def _measure_corpus_words(G, graph_path: str) -> tuple[int | None, str]:
+    """Count the words in the files the graph was actually built from.
+
+    Returns ``(words, source)``; ``(None, "unavailable")`` when the corpus
+    cannot be read, so the caller declines to print a ratio rather than
+    inventing one.
+
+    The graph stores ``source_file`` repo-relative (the "no absolute paths in
+    output" contract, #555/#932), so they are resolved against the repo root —
+    the parent of the directory holding graph.json. A graph copied away from its
+    repo therefore measures nothing, which is the honest answer: those files are
+    not there to be read.
+    """
+    from pathlib import Path
+
+    root = Path(graph_path).resolve().parent.parent
+    rel_paths = {
+        str(data.get("source_file"))
+        for _, data in G.nodes(data=True)
+        if data.get("source_file")
+    }
+    if not rel_paths:
+        return None, "unavailable"
+
+    words = 0
+    read = 0
+    for rel in rel_paths:
+        candidate = root / rel
+        try:
+            words += len(candidate.read_text(
+                encoding="utf-8", errors="ignore").split())
+        except (OSError, ValueError):
+            continue
+        read += 1
+
+    # A partial read would understate the corpus and inflate the ratio — the
+    # exact failure this replaces. Require nearly all of it.
+    if read < len(rel_paths) * 0.95 or words == 0:
+        return None, "unavailable"
+    return words, "measured"
+
+
 def run_benchmark(
     graph_path: str | None = None,
     corpus_words: int | None = None,
@@ -103,9 +145,28 @@ def run_benchmark(
     from graphify.paths import load_node_link_graph
     G = load_node_link_graph(graph_path)
 
+    corpus_source = "detect"
     if corpus_words is None:
-        # Rough estimate: each node label is ~3 words, plus source context
-        corpus_words = G.number_of_nodes() * 50
+        # NEVER estimate the denominator from the graph. This used to be
+        # `G.number_of_nodes() * 50`, which made the headline "Nx fewer tokens"
+        # a restatement of graph size: no file on disk contributed to it, and it
+        # fired silently whenever `.graphify_detect.json` was absent, which is
+        # the common case. On one 495-file repo it understated the real corpus
+        # by 4.2x. A benchmark whose denominator is derived from its own
+        # numerator is not a measurement, so measure the corpus or decline to
+        # print a ratio.
+        corpus_words, corpus_source = _measure_corpus_words(G, graph_path)
+
+    if corpus_words is None:
+        return {
+            "error": "corpus size unknown: cannot compute a token-reduction "
+                     "ratio without measuring the corpus. Run `graphify detect` "
+                     "to write .graphify_detect.json, or pass corpus_words.",
+            "corpus_words": None,
+            "corpus_words_source": corpus_source,
+            "nodes": G.number_of_nodes(),
+            "edges": G.number_of_edges(),
+        }
 
     corpus_tokens = corpus_words * 100 // 75  # words → tokens (100 words ≈ 133 tokens)
 
@@ -125,6 +186,7 @@ def run_benchmark(
     return {
         "corpus_tokens": corpus_tokens,
         "corpus_words": corpus_words,
+        "corpus_words_source": corpus_source,
         "nodes": G.number_of_nodes(),
         "edges": G.number_of_edges(),
         "avg_query_tokens": avg_query_tokens,
@@ -142,10 +204,20 @@ def print_benchmark(result: dict) -> None:
     print(f"\ngraphify token reduction benchmark")
     print(_hr(50))
     arrow = _safe("→", "->")
-    print(f"  Corpus:          {result['corpus_words']:,} words {arrow} ~{result['corpus_tokens']:,} tokens (naive)")
+    origin = {"detect": "from graphify detect",
+              "measured": "measured from source files"}.get(
+                  result.get("corpus_words_source", ""), "")
+    origin = f" ({origin})" if origin else ""
+    print(f"  Corpus:          {result['corpus_words']:,} words {arrow} ~{result['corpus_tokens']:,} tokens{origin}")
     print(f"  Graph:           {result['nodes']:,} nodes, {result['edges']:,} edges")
     print(f"  Avg query cost:  ~{result['avg_query_tokens']:,} tokens")
     print(f"  Reduction:       {result['reduction_ratio']}x fewer tokens per query")
+    # State the baseline. "Reduction" is against reading the WHOLE corpus for
+    # every question, which no agent does — an agent that greps first opens one
+    # to three files. Printing the ratio without the baseline invites reading it
+    # as a saving over normal tool use, which it is not.
+    print(f"  Baseline:        reading every file for every question;")
+    print(f"                   a grep-first agent opens far fewer")
     print(f"\n  Per question:")
     for p in result["per_question"]:
         print(f"    [{p['reduction']}x] {p['question'][:55]}")

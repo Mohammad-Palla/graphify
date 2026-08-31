@@ -100,12 +100,38 @@ def test_run_benchmark_per_question_list(tmp_path):
         assert "query_tokens" in p
         assert "reduction" in p
 
-def test_run_benchmark_estimates_corpus_if_no_words(tmp_path):
+def test_run_benchmark_refuses_to_invent_a_corpus_size(tmp_path):
+    """No corpus size and no readable sources => no ratio, not a guessed one.
+
+    This used to fall back to `G.number_of_nodes() * 50`, which made the headline
+    "Nx fewer tokens per query" a restatement of graph size — no file on disk
+    contributed to it — and fired silently whenever `.graphify_detect.json` was
+    missing, which is the common case.
+    """
     G = _make_graph()
     graph_file = tmp_path / "graph.json"
     _write_graph(G, graph_file)
     result = run_benchmark(str(graph_file), corpus_words=None)
-    assert result["corpus_words"] > 0
+    assert "error" in result
+    assert result["corpus_words"] is None
+    assert result["corpus_words_source"] == "unavailable"
+    assert "reduction_ratio" not in result
+
+
+def test_run_benchmark_measures_corpus_from_source_files(tmp_path):
+    """With the sources on disk, the denominator is counted from them."""
+    repo = tmp_path / "repo"
+    (repo / "graphify-out").mkdir(parents=True)
+    (repo / "a.py").write_text("one two three four five\n", encoding="utf-8")
+    G = _make_graph()
+    for _, data in G.nodes(data=True):
+        data["source_file"] = "a.py"
+    graph_file = repo / "graphify-out" / "graph.json"
+    _write_graph(G, graph_file)
+
+    result = run_benchmark(str(graph_file), corpus_words=None)
+    assert result["corpus_words"] == 5, result
+    assert result["corpus_words_source"] == "measured"
 
 def test_run_benchmark_error_on_empty_graph(tmp_path):
     G = nx.Graph()
