@@ -8,12 +8,24 @@ from __future__ import annotations
 
 
 from pathlib import Path
+from graphify.extractors import kernel as _kernel
 from graphify.extractors.base import _file_stem, _make_id, _read_text
+
+
+# Two grammars, so two routing keys. The SUFFIX decides, here and only here --
+# the kernel reads the language key and never sniffs the path itself.
+_KERNEL_GRAMMAR = _kernel.BespokeGrammar("tree_sitter_ocaml", "language_ocaml")
+_KERNEL_GRAMMAR_MLI = _kernel.BespokeGrammar(
+    "tree_sitter_ocaml", "language_ocaml_interface")
 
 
 def extract_ocaml(path: Path) -> dict:
     """Extract modules, values, functions, types, variant constructors, `open`
     imports, and (for .ml) function calls from an OCaml source file."""
+    native = _kernel.try_extract(
+        path, _KERNEL_GRAMMAR_MLI if path.suffix == ".mli" else _KERNEL_GRAMMAR)
+    if native is not None:
+        return native
     try:
         import tree_sitter_ocaml as tsocaml
         from tree_sitter import Language, Parser

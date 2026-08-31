@@ -84,6 +84,12 @@ pub type Walker = for<'py> fn(
 /// alamofire swift          98   90.8%      9.2%          0
 /// swift-nio swift         554   73.5%     26.5%          0
 /// vapor    swift          251   89.6%     10.4%          0
+/// zls      zig            103   95.1%      4.9%          0
+/// tigerbeetle zig         247   98.4%      1.6%          0
+/// ziglang  zig           1200   93.7%      6.3%          0
+/// elixir   elixir          568  100.0%      0.0%          0
+/// phoenix  elixir          177  100.0%      0.0%          0
+/// ecto     elixir          126  100.0%      0.0%          0
 /// ```
 ///
 /// Scala is the only language ported here with NO parse-error floor: 400/400
@@ -178,7 +184,7 @@ pub fn supported() -> Vec<&'static str> {
     vec![
         "typescript", "tsx", "javascript", "python", "java", "csharp", "c", "cpp",
         "php", "bash", "go", "rust", "ruby", "kotlin", "lua", "scala",
-        "swift",
+        "swift", "zig", "elixir", "ocaml", "ocaml_interface",
     ]
 }
 
@@ -213,6 +219,10 @@ pub fn walker_for(language: &str) -> Option<Walker> {
         "groovy" => Some(crate::groovy::walk_groovy),
         "scala" => Some(crate::scala::walk_scala),
         "swift" => Some(crate::swift::walk_swift),
+        "zig" => Some(crate::zig::walk_zig),
+        "elixir" => Some(crate::elixir::walk_elixir),
+        "ocaml" => Some(crate::ocaml::walk_ocaml),
+        "ocaml_interface" => Some(crate::ocaml::walk_ocaml_interface),
         _ => None,
     }
 }
@@ -238,7 +248,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
 /// The node-kind and field counts change with essentially any grammar revision,
 /// which is what makes the triple a usable proxy for "same grammar".
 pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
-    let langs: [(&'static str, tree_sitter::Language); 18] = [
+    let langs: [(&'static str, tree_sitter::Language); 22] = [
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ("javascript", tree_sitter_javascript::LANGUAGE.into()),
@@ -257,6 +267,10 @@ pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
         ("groovy", tree_sitter_groovy::LANGUAGE.into()),
         ("scala", tree_sitter_scala::LANGUAGE.into()),
         ("swift", tree_sitter_swift::LANGUAGE.into()),
+        ("zig", tree_sitter_zig::LANGUAGE.into()),
+        ("elixir", tree_sitter_elixir::LANGUAGE.into()),
+        ("ocaml", tree_sitter_ocaml::LANGUAGE_OCAML.into()),
+        ("ocaml_interface", tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE.into()),
     ];
     langs
         .iter()

@@ -4,11 +4,18 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from graphify.extractors import kernel as _kernel
 from graphify.extractors.base import _file_stem, _make_id, _read_text
+
+
+_KERNEL_GRAMMAR = _kernel.BespokeGrammar("tree_sitter_zig")
 
 
 def extract_zig(path: Path) -> dict:
     """Extract functions, structs, enums, unions, and imports from a .zig file."""
+    native = _kernel.try_extract(path, _KERNEL_GRAMMAR)
+    if native is not None:
+        return native
     try:
         import tree_sitter_zig as tszig
         from tree_sitter import Language, Parser

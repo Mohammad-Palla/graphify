@@ -70,6 +70,8 @@ _GRAMMAR_TO_LANGUAGE: dict[tuple[str, str], str] = {
     ("tree_sitter_groovy", "language"): "groovy",
     ("tree_sitter_scala", "language"): "scala",
     ("tree_sitter_swift", "language"): "swift",
+    ("tree_sitter_ocaml", "language_ocaml"): "ocaml",
+    ("tree_sitter_ocaml", "language_ocaml_interface"): "ocaml_interface",
 }
 
 # The reverse map, for the grammar-version check below: kernel language key ->

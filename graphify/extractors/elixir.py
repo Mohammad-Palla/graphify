@@ -4,11 +4,18 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from graphify.extractors import kernel as _kernel
 from graphify.extractors.base import _LANGUAGE_BUILTIN_GLOBALS, _file_stem, _make_id
+
+
+_KERNEL_GRAMMAR = _kernel.BespokeGrammar("tree_sitter_elixir")
 
 
 def extract_elixir(path: Path) -> dict:
     """Extract modules, functions, imports, and calls from a .ex/.exs file."""
+    native = _kernel.try_extract(path, _KERNEL_GRAMMAR)
+    if native is not None:
+        return native
     try:
         import tree_sitter_elixir as tselixir
         from tree_sitter import Language, Parser

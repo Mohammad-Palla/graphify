@@ -30,6 +30,11 @@ pub enum Val {
     S(String),
     Static(&'static str),
     F(f64),
+    /// A Python INT, which `F` is not. `extract_elixir`'s result carries
+    /// `input_tokens: 0` / `output_tokens: 0` as ints, and `0` and `0.0` are
+    /// different values to `json.dumps` -- so emitting them through `F` would
+    /// report every Elixir file DIVERGENT.
+    I(i64),
     B(bool),
     None,
     /// A JSON list. Only `scope_chain` uses it: C#'s `add_node` stamps
@@ -47,6 +52,7 @@ impl Val {
             Val::S(s) => s.into_pyobject(py)?.into_any(),
             Val::Static(s) => (*s).into_pyobject(py)?.into_any(),
             Val::F(f) => f.into_pyobject(py)?.into_any(),
+            Val::I(i) => i.into_pyobject(py)?.into_any(),
             // `bool` converts to the SINGLETON `Py_True`/`Py_False`, whose
             // `into_pyobject` yields a `Borrowed`; `.to_owned()` makes the two
             // match arms one type.
