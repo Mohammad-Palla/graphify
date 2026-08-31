@@ -35,6 +35,11 @@ tree-sitter-kotlin-ng = "1.1.0"
 tree-sitter-lua = "0.5.0"
 tree-sitter-groovy = "0.1.2"
 tree-sitter-scala = "0.26.2"
+# Matches the Python side exactly (tree-sitter-swift 0.7.3, ABI 15, 563 kinds,
+# 46 fields) -- the crate and the PyPI package are cut from the same grammar
+# release, which the load-time fingerprint check then verifies rather than
+# trusts.
+tree-sitter-swift = "0.7.3"
 # `_csharp_namespace_id` is `sha1(dotted_name).hexdigest()[:16]`, so the digest
 # is part of the node id and has to be the real thing.
 sha1 = "0.10"

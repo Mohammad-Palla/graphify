@@ -40,6 +40,7 @@ mod groovy;
 mod php;
 mod ruby;
 mod scala;
+mod swift;
 mod rust;
 mod java;
 mod kotlin;

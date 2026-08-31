@@ -81,12 +81,25 @@ pub type Walker = for<'py> fn(
 /// luals    lua            479  100.0%      0.0%          0
 /// cats     scala          835   95.6%      4.4%          0
 /// akka     scala         1200  100.0%      0.0%          0
+/// alamofire swift          98   90.8%      9.2%          0
+/// swift-nio swift         554   73.5%     26.5%          0
+/// vapor    swift          251   89.6%     10.4%          0
 /// ```
 ///
 /// Scala is the only language ported here with NO parse-error floor: 400/400
 /// sampled files parse clean on cats and akka. Its 4.4% deferral on cats is
 /// entirely `non_ascii_id` -- that codebase leans on symbolic operators, and the
 /// id recipe's casefold+NFKC fixpoint is not reproduced in Rust.
+///
+/// Swift is the largest port on this engine -- nine guard sites, eleven helper
+/// functions, and the only one that needed the ENGINE widened (`prescan` now
+/// returns a pair; see `swift/mod.rs`). Two numbers are worth keeping. Its
+/// native rate is 79.8% over 903 files, the lowest of any ROUTED language, and
+/// every single deferral is `parse_error` -- not one construct gap, so the
+/// walker is at its grammar's ceiling and no further Swift work can raise the
+/// rate. And that ceiling is why the rate clause is a judgement and not a
+/// threshold: 79.8% pays (one file in five parsed twice), where Groovy's 16%
+/// does not.
 ///
 /// Lua is the cheapest language ported here and the number worth remembering is
 /// not its 99.8%: `engine.py` has ZERO `_is_lua` guards and zero
@@ -165,6 +178,7 @@ pub fn supported() -> Vec<&'static str> {
     vec![
         "typescript", "tsx", "javascript", "python", "java", "csharp", "c", "cpp",
         "php", "bash", "go", "rust", "ruby", "kotlin", "lua", "scala",
+        "swift",
     ]
 }
 
@@ -198,6 +212,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
         // ready.
         "groovy" => Some(crate::groovy::walk_groovy),
         "scala" => Some(crate::scala::walk_scala),
+        "swift" => Some(crate::swift::walk_swift),
         _ => None,
     }
 }
@@ -223,7 +238,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
 /// The node-kind and field counts change with essentially any grammar revision,
 /// which is what makes the triple a usable proxy for "same grammar".
 pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
-    let langs: [(&'static str, tree_sitter::Language); 17] = [
+    let langs: [(&'static str, tree_sitter::Language); 18] = [
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ("javascript", tree_sitter_javascript::LANGUAGE.into()),
@@ -241,6 +256,7 @@ pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
         ("lua", tree_sitter_lua::LANGUAGE.into()),
         ("groovy", tree_sitter_groovy::LANGUAGE.into()),
         ("scala", tree_sitter_scala::LANGUAGE.into()),
+        ("swift", tree_sitter_swift::LANGUAGE.into()),
     ];
     langs
         .iter()

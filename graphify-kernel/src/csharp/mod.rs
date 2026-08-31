@@ -74,8 +74,14 @@ fn emit_type_refs(
 }
 
 impl LangHooks for CSharp {
-    fn prescan<'tree>(&self, ctx: &Ctx<'_, 'tree>, root: Node<'tree>) -> R<HashSet<String>> {
-        pre_scan_interfaces(ctx, root)
+    /// Only `.0`. C# classifies a base name as an interface or not; it never
+    /// needs the class-name set Swift fills in `.1`.
+    fn prescan<'tree>(
+        &self,
+        ctx: &Ctx<'_, 'tree>,
+        root: Node<'tree>,
+    ) -> R<(HashSet<String>, HashSet<String>)> {
+        Ok((pre_scan_interfaces(ctx, root)?, HashSet::new()))
     }
 
     fn import_handler<'tree>(&self, ctx: &mut Ctx<'_, 'tree>, node: Node<'tree>) -> R<()> {

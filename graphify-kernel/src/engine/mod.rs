@@ -372,13 +372,26 @@ pub trait LangHooks {
 
     /// A per-file name pre-scan, run over the whole tree BEFORE the walk.
     ///
-    /// C# is the one caller: `_csharp_pre_scan_interfaces` collects the file's
-    /// `interface_declaration` names so `on_class` can classify a base type as
-    /// `implements` rather than `inherits` without a second pass. Languages with
-    /// no pre-scan leave the set empty. (Swift's `_swift_pre_scan` returns TWO
-    /// sets; when Swift lands, this widens rather than a second slot appearing.)
-    fn prescan<'tree>(&self, _ctx: &Ctx<'_, 'tree>, _root: Node<'tree>) -> R<HashSet<String>> {
-        Ok(HashSet::new())
+    /// Two callers, and the pair is the same question in both languages:
+    /// "is this base name a PROTOCOL/INTERFACE, or a CLASS?".
+    ///
+    /// * C# (`_csharp_pre_scan_interfaces`) fills only `.0`, the file's
+    ///   `interface_declaration` names, so `on_class` can say `implements`
+    ///   rather than `inherits` without a second pass. `.1` stays empty.
+    /// * Swift (`_swift_pre_scan`) fills BOTH: `.0` the `protocol_declaration`
+    ///   names, `.1` the class/struct/enum/actor names. Swift needs the second
+    ///   set because its answer is not a two-way default -- see
+    ///   `swift::helpers::classify_base`.
+    ///
+    /// One widened slot rather than a second hook: a language that had to
+    /// pre-scan for something UNRELATED would be a new slot, but these two are
+    /// the same lookup and belong in one place.
+    fn prescan<'tree>(
+        &self,
+        _ctx: &Ctx<'_, 'tree>,
+        _root: Node<'tree>,
+    ) -> R<(HashSet<String>, HashSet<String>)> {
+        Ok((HashSet::new(), HashSet::new()))
     }
 }
 
@@ -480,9 +493,12 @@ pub struct Ctx<'a, 'tree> {
     /// stamped on every non-namespace node as `metadata.scope_chain` and read by
     /// the `using` import handler for `scope_kind` / `scope_id`.
     pub scope_stack: Vec<String>,
-    /// Whatever `LangHooks::prescan` collected for this file. C#: the names
-    /// declared as `interface` here.
+    /// `LangHooks::prescan` `.0`: the names declared in this file as an
+    /// INTERFACE (C#) or a PROTOCOL (Swift).
     pub prescan: HashSet<String>,
+    /// `LangHooks::prescan` `.1`: the names declared as a CLASS-like type.
+    /// Swift alone -- C# leaves it empty, and reads only `prescan`.
+    pub prescan_classes: HashSet<String>,
 
     /// `label_to_nid_ci`: the same map as `label_to_nid`, keyed on the
     /// LOWERCASED label. PHP's framework blocks resolve a class named in a
@@ -527,6 +543,19 @@ pub struct Ctx<'a, 'tree> {
     /// member-call pass uses to type a receiver. Populated by `before_calls` and
     /// emitted under `EngineConfig::type_table_key`.
     pub type_table: HashMap<String, String>,
+
+    /// `swift_extensions`: `(nid, label)` for every `class_declaration` that is
+    /// really an `extension`. tree-sitter-swift gives `class Foo` and
+    /// `extension Foo` the SAME node kind, so a same-file pair collapses through
+    /// `seen_ids` but a cross-file one cannot (the file stem is part of the id).
+    /// Emitted for a corpus-level merge after every file is parsed.
+    pub swift_extensions: Vec<(String, String)>,
+
+    /// `swift_factory_bindings`: `name -> (FactoryType, method)` for
+    /// `let x = Factory.make()`, which has no in-file type. Label-only, no nids,
+    /// so the per-file AST cache stays valid; resolved corpus-side against the
+    /// factory method's marked plain return type (#2561).
+    pub swift_factory_bindings: HashMap<String, (String, String)>,
 
     /// The include resolver, for the languages that have one. `None` makes any
     /// file that needs it defer, which is the same rule the JS and Python
@@ -923,6 +952,9 @@ fn extract<'py>(
         namespace_stack: Vec::new(),
         scope_stack: Vec::new(),
         prescan: HashSet::new(),
+        prescan_classes: HashSet::new(),
+        swift_extensions: Vec::new(),
+        swift_factory_bindings: HashMap::new(),
         label_to_nid_ci: HashMap::new(),
         seen_rel_triples: HashSet::new(),
         pending_listen_edges: Vec::new(),
@@ -936,7 +968,9 @@ fn extract<'py>(
 
     // Before the file node, as in Python: `_csharp_pre_scan_interfaces(root,
     // source)` runs above `add_node(file_nid, ...)`.
-    ctx.prescan = cfg.hooks.prescan(&ctx, root)?;
+    let (pre_ifaces, pre_classes) = cfg.hooks.prescan(&ctx, root)?;
+    ctx.prescan = pre_ifaces;
+    ctx.prescan_classes = pre_classes;
 
     let file_label = path.rsplit('/').next().unwrap_or(path).to_string();
     ctx.add_node(&file_nid, &file_label, 1);
@@ -1082,6 +1116,7 @@ pub fn engine_configs() -> Vec<&'static EngineConfig> {
         &crate::lua::CONFIG,
         &crate::groovy::CONFIG,
         &crate::scala::CONFIG,
+        &crate::swift::CONFIG,
     ]
 }
 
