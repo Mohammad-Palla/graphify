@@ -36,6 +36,7 @@ mod c;
 mod cpp;
 mod csharp;
 mod go;
+mod groovy;
 mod php;
 mod ruby;
 mod rust;

@@ -178,6 +178,18 @@ pub fn walker_for(language: &str) -> Option<Walker> {
         "ruby" => Some(crate::ruby::walk_ruby),
         "kotlin" => Some(crate::kotlin::walk_kotlin),
         "lua" => Some(crate::lua::walk_lua),
+        // STAGED DELIBERATELY, and not because parity failed -- Groovy is
+        // DIVERGENT 0 over 2,133 files. It is absent from `supported` because
+        // its NATIVE RATE is too low for routing to pay: `tree-sitter-groovy`
+        // 0.1.2 produces an ERROR node on 84% of Apache Groovy's own files and
+        // 82% of `.gradle` build scripts, measured on the PYTHON side too, so
+        // it is the grammar and not this walker. At ~13% native, 87% of files
+        // pay a wasted Rust parse and are then parsed again by Python.
+        // Measured cold on groovy-apache, ABBA: kernel off 38.7s / 42.8s, on
+        // 41.7s / 43.1s -- no win, and the sign never favours ON. Flip the one
+        // line in `supported` if the grammar improves; the walker is gated and
+        // ready.
+        "groovy" => Some(crate::groovy::walk_groovy),
         _ => None,
     }
 }
@@ -203,7 +215,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
 /// The node-kind and field counts change with essentially any grammar revision,
 /// which is what makes the triple a usable proxy for "same grammar".
 pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
-    let langs: [(&'static str, tree_sitter::Language); 15] = [
+    let langs: [(&'static str, tree_sitter::Language); 16] = [
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ("javascript", tree_sitter_javascript::LANGUAGE.into()),
@@ -219,6 +231,7 @@ pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
         ("ruby", tree_sitter_ruby::LANGUAGE.into()),
         ("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into()),
         ("lua", tree_sitter_lua::LANGUAGE.into()),
+        ("groovy", tree_sitter_groovy::LANGUAGE.into()),
     ];
     langs
         .iter()

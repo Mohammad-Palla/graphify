@@ -1080,6 +1080,7 @@ pub fn engine_configs() -> Vec<&'static EngineConfig> {
         &crate::ruby::CONFIG,
         &crate::kotlin::CONFIG,
         &crate::lua::CONFIG,
+        &crate::groovy::CONFIG,
     ]
 }
 

@@ -107,21 +107,34 @@ fn emit_type_refs(
     Ok(())
 }
 
-/// The annotation block, shared by the class and function hooks.
+/// The annotation block, shared by the class and function hooks -- and by Groovy.
 ///
-/// The two differ in ONE way in the Python and it is cosmetic: at class level
+/// Java's two call sites differ in ONE way and it is cosmetic: at class level
 /// the dotted-name substitution reads `if "." in anno_raw and _is_java:
 /// anno_name = anno_raw`, at function level `anno_raw if "." in anno_raw else
 /// anno_name`. Both reduce to the same choice for Java, so one helper serves
 /// both -- stated because the asymmetry invites "fixing" one to match the other.
-fn emit_annotations(ctx: &mut Ctx, owner_nid: &str, decl: Node, line: usize) -> R<()> {
+///
+/// `dotted` is where GROOVY diverges, and it is not cosmetic. The class-level
+/// guard is `and _is_java`, so Groovy takes the bare `anno_name` even for
+/// `@org.pkg.Foo`. The Python says why: `_resolve_java_type_references` maps
+/// internal FQNs back to real nodes for Java (#2504) and "Groovy has no such
+/// resolver pass, so it keeps the legacy bare-name stub". Passing `true` here
+/// for Groovy would silently retarget every inline-qualified annotation edge.
+pub(crate) fn emit_annotations(
+    ctx: &mut Ctx,
+    owner_nid: &str,
+    decl: Node,
+    line: usize,
+    dotted: bool,
+) -> R<()> {
     let mut targets: HashSet<String> = HashSet::new();
     let names: Vec<(String, String)> = helpers::annotation_names(ctx, decl)?
         .into_iter()
         .map(|(a, b)| (a.to_string(), b.to_string()))
         .collect();
     for (anno_name, anno_raw) in names {
-        let chosen = if anno_raw.contains('.') { &anno_raw } else { &anno_name };
+        let chosen = if dotted && anno_raw.contains('.') { &anno_raw } else { &anno_name };
         let target = ctx.ensure_named_node(chosen, line)?;
         if target != owner_nid && targets.insert(target.clone()) {
             ctx.add_edge_ctx(owner_nid, &target, "references", line, "attribute");
@@ -140,19 +153,14 @@ fn emit_annotations(ctx: &mut Ctx, owner_nid: &str, decl: Node, line: usize) -> 
     Ok(())
 }
 
-impl LangHooks for Java {
-    fn import_handler<'tree>(&self, ctx: &mut Ctx<'_, 'tree>, node: Node<'tree>) -> R<()> {
-        imports::import_java(ctx, node)
-    }
-
-    fn on_class<'tree>(
-        &self,
-        ctx: &mut Ctx<'_, 'tree>,
-        node: Node<'tree>,
-        class_nid: &str,
-        _class_name: &str,
-        line: usize,
-    ) -> R<()> {
+/// `extends` / `implements` / interface-`extends`, the branch guarded in the
+/// Python by `config.ts_module in ("tree_sitter_java", "tree_sitter_groovy")`.
+///
+/// Shared with Groovy rather than copied, because it is literally the same
+/// branch: a module-name guard, not an `_is_java` one. That distinction is the
+/// same one that cost 241 DIVERGENT files on C, where an `_is_<lang>` grep
+/// could not see a `config.ts_module in (...)` guard.
+pub(crate) fn emit_inheritance(ctx: &mut Ctx, node: Node, class_nid: &str, line: usize) -> R<()> {
         // extends
         if let Some(sup) = node.child_by_field_name("superclass") {
             if let Some(sub) = children(sup).into_iter().find(|c| c.is_named()) {
@@ -190,8 +198,25 @@ impl LangHooks for Java {
                 }
             }
         }
+    Ok(())
+}
 
-        emit_annotations(ctx, class_nid, node, line)?;
+impl LangHooks for Java {
+    fn import_handler<'tree>(&self, ctx: &mut Ctx<'_, 'tree>, node: Node<'tree>) -> R<()> {
+        imports::import_java(ctx, node)
+    }
+
+    fn on_class<'tree>(
+        &self,
+        ctx: &mut Ctx<'_, 'tree>,
+        node: Node<'tree>,
+        class_nid: &str,
+        _class_name: &str,
+        line: usize,
+    ) -> R<()> {
+        emit_inheritance(ctx, node, class_nid, line)?;
+
+        emit_annotations(ctx, class_nid, node, line, true)?;
 
         // record components: the reference line is the COMPONENT's, not the
         // record's.
@@ -292,7 +317,7 @@ impl LangHooks for Java {
         if let Some(return_node) = node.child_by_field_name("type") {
             emit_type_refs(ctx, func_nid, Some(return_node), "return_type", line, false)?;
         }
-        emit_annotations(ctx, func_nid, node, line)
+        emit_annotations(ctx, func_nid, node, line, true)
     }
 
     fn extra_walk<'tree>(
