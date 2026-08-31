@@ -41,6 +41,7 @@ mod ruby;
 mod rust;
 mod java;
 mod kotlin;
+mod lua;
 mod js;
 mod languages;
 mod py;
@@ -78,6 +79,7 @@ pub struct Resolvers<'py> {
     pub js: js::imports::Resolver<'py>,
     pub py: py::imports::Resolver<'py>,
     pub c: c::imports::Resolver<'py>,
+    pub lua: lua::Resolver<'py>,
 }
 
 /// The kernel's own version, independent of Graphify's. Bumped whenever the
@@ -127,7 +129,7 @@ fn supported_languages() -> Vec<&'static str> {
 /// silently wrong. Omitting it makes any Python file containing a relative import
 /// defer, since there is no safe default for where it points.
 #[pyfunction]
-#[pyo3(signature = (path, source, language, resolve_import=None, resolve_module=None, resolve_py_import=None, resolve_c_include=None))]
+#[pyo3(signature = (path, source, language, resolve_import=None, resolve_module=None, resolve_py_import=None, resolve_c_include=None, resolve_lua_import=None))]
 fn extract_file<'py>(
     py: Python<'py>,
     path: &str,
@@ -137,11 +139,13 @@ fn extract_file<'py>(
     resolve_module: Option<Bound<'py, PyAny>>,
     resolve_py_import: Option<Bound<'py, PyAny>>,
     resolve_c_include: Option<Bound<'py, PyAny>>,
+    resolve_lua_import: Option<Bound<'py, PyAny>>,
 ) -> PyResult<(Option<Bound<'py, PyDict>>, Option<&'static str>)> {
     let res = Resolvers {
         js: js::imports::Resolver::new(resolve_import, resolve_module),
         py: py::imports::Resolver::new(resolve_py_import),
         c: c::imports::Resolver::new(resolve_c_include),
+        lua: lua::Resolver::new(resolve_lua_import),
     };
     match languages::walker_for(language) {
         None => Ok((None, Some("no_walker"))),

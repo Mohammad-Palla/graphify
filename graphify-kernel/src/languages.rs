@@ -76,7 +76,18 @@ pub type Walker = for<'py> fn(
 /// okhttp   kotlin         617   98.9%      1.1%          0
 /// redis    c              756   56.2%     43.8%          0
 /// curl     c             1014   73.7%     26.3%          0
+/// kong     lua           1309   99.9%      0.1%          0
+/// neovim   lua            844   99.6%      0.4%          0
+/// luals    lua            479  100.0%      0.0%          0
 /// ```
+///
+/// Lua is the cheapest language ported here and the number worth remembering is
+/// not its 99.8%: `engine.py` has ZERO `_is_lua` guards and zero
+/// `tree_sitter_lua` guards, so it needed no new engine hook position at all --
+/// only the config data and one `import_handler` for `require()`. It reached
+/// DIVERGENT 0 on the first parity run, the only language here that has. The
+/// four deferrals over 2,632 files are two parse errors and two non-UTF-8
+/// sources.
 ///
 /// C's native rate is the lowest of any language here and, like C#'s, it is a
 /// parser limit rather than a walker gap -- but a much harder one. 31.8% of
@@ -146,7 +157,7 @@ pub type Walker = for<'py> fn(
 pub fn supported() -> Vec<&'static str> {
     vec![
         "typescript", "tsx", "javascript", "python", "java", "csharp", "c", "cpp",
-        "php", "bash", "go", "rust", "ruby", "kotlin",
+        "php", "bash", "go", "rust", "ruby", "kotlin", "lua",
     ]
 }
 
@@ -166,6 +177,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
         "rust" => Some(crate::rust::walk_rust),
         "ruby" => Some(crate::ruby::walk_ruby),
         "kotlin" => Some(crate::kotlin::walk_kotlin),
+        "lua" => Some(crate::lua::walk_lua),
         _ => None,
     }
 }
@@ -191,7 +203,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
 /// The node-kind and field counts change with essentially any grammar revision,
 /// which is what makes the triple a usable proxy for "same grammar".
 pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
-    let langs: [(&'static str, tree_sitter::Language); 14] = [
+    let langs: [(&'static str, tree_sitter::Language); 15] = [
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ("javascript", tree_sitter_javascript::LANGUAGE.into()),
@@ -206,6 +218,7 @@ pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
         ("rust", tree_sitter_rust::LANGUAGE.into()),
         ("ruby", tree_sitter_ruby::LANGUAGE.into()),
         ("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into()),
+        ("lua", tree_sitter_lua::LANGUAGE.into()),
     ];
     langs
         .iter()

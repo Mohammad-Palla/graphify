@@ -66,6 +66,7 @@ _GRAMMAR_TO_LANGUAGE: dict[tuple[str, str], str] = {
     ("tree_sitter_rust", "language"): "rust",
     ("tree_sitter_ruby", "language"): "ruby",
     ("tree_sitter_kotlin", "language"): "kotlin",
+    ("tree_sitter_lua", "language"): "lua",
 }
 
 # The reverse map, for the grammar-version check below: kernel language key ->
@@ -267,6 +268,28 @@ def _c_include_resolver(str_path: str) -> Callable[[str], str | None]:
     def _resolve(raw: str) -> str | None:
         target = _resolve_c_include_path(raw, str_path)
         return None if target is None else str(target)
+
+    return _resolve
+
+
+def _lua_import_resolver(str_path: str) -> Callable[[str], str | None]:
+    """A `(raw_module) -> node-id | None` callable for one Lua file.
+
+    `_resolve_lua_import_target` turns `require("pkg.b")` into a node id by
+    walking up to six directories probing `pkg/b.lua`, `pkg/b.luau`,
+    `pkg/b/init.lua` and `pkg/b/init.luau` -- up to 24 `is_file()` hits against a
+    tree the walker must not touch itself. It calls Graphify's own function so
+    the resolution cannot drift from the Python path.
+
+    Note it returns an id, not a path: on a miss it falls back to
+    `_make_id(raw_module)` rather than dropping the edge (#1075), so the only
+    None here is the empty-module case the Python also drops.
+    """
+    from graphify.extractors.resolution import _resolve_lua_import_target
+
+    def _resolve(raw_module: str) -> str | None:
+        nid = _resolve_lua_import_target(raw_module, str_path)
+        return nid or None
 
     return _resolve
 
@@ -561,6 +584,7 @@ def try_extract(path: Path, config: Any,
             str_path, source, language,
             _import_resolver(str_path), _module_resolver(str_path),
             _py_import_resolver(str_path), _c_include_resolver(str_path),
+            _lua_import_resolver(str_path),
         )
     except BaseException as exc:
         # BaseException, not Exception, and deliberately so.
