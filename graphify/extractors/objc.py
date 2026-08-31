@@ -1,6 +1,7 @@
 """objc — moved verbatim from graphify/extract.py."""
 from __future__ import annotations
 
+from graphify.extractors import kernel as _kernel
 from graphify.extractors.base import _file_stem, _make_id, _read_text
 from graphify.extractors.engine import _cpp_declarator_name, _semantic_reference_edge
 from graphify.extractors.resolution import _resolve_c_include_path
@@ -74,8 +75,14 @@ def _objc_local_var_types(body_node, source: bytes, table: dict[str, str]) -> No
         for c in n.children:
             stack.append(c)
 
+_KERNEL_GRAMMAR = _kernel.BespokeGrammar("tree_sitter_objc")
+
+
 def extract_objc(path: Path) -> dict:
     """Extract interfaces, implementations, protocols, methods, and imports from .m/.mm/.h files."""
+    native = _kernel.try_extract(path, _KERNEL_GRAMMAR)
+    if native is not None:
+        return native
     try:
         import tree_sitter_objc as tsobjc
         from tree_sitter import Language, Parser
@@ -414,7 +421,14 @@ def extract_objc(path: Path) -> dict:
     walk(root)
 
     # Second pass: resolve calls inside method bodies
-    all_method_nids = {n["id"] for n in nodes if n["id"] != file_nid}
+    # A LIST in `nodes` insertion order, not a set. The loop below emits one
+    # `calls` edge per matching candidate, so iterating a set of strings made the
+    # EDGE ORDER depend on Python's per-process string hash seed: measured, 4 of
+    # 183 Texture files changed edge order between runs with an identical edge
+    # SET. Edge order reaches the exported graph.json and the AST cache, so two
+    # builds of the same ObjC repo could differ byte for byte. Insertion order is
+    # deterministic and is what every other walker here resolves in.
+    all_method_nids = [n["id"] for n in nodes if n["id"] != file_nid]
     class_method_nids: dict[str, set[str]] = {}
     for m_nid, _, container_nid in method_bodies:
         class_method_nids.setdefault(container_nid, set()).add(m_nid)

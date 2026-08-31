@@ -113,8 +113,22 @@ pub fn func_name(ctx: &Ctx, node: Node) -> R<Option<String>> {
 /// None for anything that is not a plain named local -- an array, a function
 /// pointer, a structured binding -- so the type table never records a guess.
 pub fn declarator_name(ctx: &Ctx, node: Node) -> R<Option<String>> {
+    declarator_name_src(ctx.src, node)
+}
+
+/// The same function against raw source bytes, for a walker that has its own
+/// `Ctx` rather than the engine's.
+///
+/// `objc/` shares this grammar's declarator shapes exactly -- `_cpp_declarator_name`
+/// is what `extract_objc` itself calls -- so it must share the code too, not a
+/// copy that can drift.
+pub fn declarator_name_src(src: &[u8], node: Node) -> R<Option<String>> {
     if node.kind() == "identifier" {
-        return Ok(Some(ctx.text(node)?.to_string()));
+        return Ok(Some(
+            crate::js::ast::text_checked(node, src)
+                .ok_or("invalid_utf8_text")?
+                .to_string(),
+        ));
     }
     if matches!(
         node.kind(),
@@ -130,7 +144,7 @@ pub fn declarator_name(ctx: &Ctx, node: Node) -> R<Option<String>> {
             });
         }
         if let Some(inner) = inner {
-            return declarator_name(ctx, inner);
+            return declarator_name_src(src, inner);
         }
     }
     Ok(None)

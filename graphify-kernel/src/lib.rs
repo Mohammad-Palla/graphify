@@ -43,6 +43,7 @@ mod scala;
 mod elixir;
 mod fortran;
 mod julia;
+mod objc;
 mod ocaml;
 mod swift;
 mod zig;
