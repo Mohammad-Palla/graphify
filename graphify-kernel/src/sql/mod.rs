@@ -115,6 +115,8 @@ struct Patterns {
     /// The clauses that end a policy's role/command header.
     policy_body: Regex,
     policy_for: Regex,
+    /// A `-- ...` line comment, blanked before a statement body is parsed.
+    line_comment: Regex,
 }
 
 impl Patterns {
@@ -148,8 +150,14 @@ impl Patterns {
                 .expect("block_end"),
             // `(?ims)`: line-anchored `^`, case-insensitive, and `.` spans
             // newlines because a grant on a routine routinely wraps.
-            grant_stmt: Regex::new(r"(?ims)^[ \t]*(GRANT|REVOKE)\b(.*?);")
+            // `(?:;|\z)`, not just `;`: the LAST statement in a file often has
+            // no terminator, and requiring one silently dropped 9 real
+            // GRANT/REVOKEs across the two SQL corpora. Python spells end-of-text
+            // `\Z`, Rust spells it `\z` -- same anchor, and NOT `$`, which under
+            // `(?m)` would mean end of LINE and truncate a wrapped statement.
+            grant_stmt: Regex::new(r"(?ims)^[ \t]*(GRANT|REVOKE)\b(.*?)(?:;|\z)")
                 .expect("grant_stmt"),
+            line_comment: Regex::new(r"--[^\n]*").expect("line_comment"),
             kw_on: Regex::new(r"(?i)\bON\b").expect("kw_on"),
             kw_to: Regex::new(r"(?i)\bTO\b").expect("kw_to"),
             kw_from: Regex::new(r"(?i)\bFROM\b").expect("kw_from"),
@@ -172,7 +180,7 @@ impl Patterns {
                 .expect("role_name"),
             arg_list: Regex::new(r"(?s)\s*\(.*\)\s*$").expect("arg_list"),
             policy_stmt: Regex::new(&format!(
-                r"(?ims)^[ \t]*CREATE\s+POLICY\s+(?P<name>{np})\s+ON\s+(?P<table>{np}(?:\s*\.\s*{np})*)(?P<rest>.*?);",
+                r"(?ims)^[ \t]*CREATE\s+POLICY\s+(?P<name>{np})\s+ON\s+(?P<table>{np}(?:\s*\.\s*{np})*)(?P<rest>.*?)(?:;|\z)",
                 np = NAME_PART))
                 .expect("policy_stmt"),
             policy_body: Regex::new(r"(?i)\b(?:USING|WITH\s+CHECK)\b").expect("policy_body"),
@@ -197,7 +205,7 @@ fn patterns() -> &'static Patterns {
 fn norm_ident(name: &str) -> String {
     name.split('.')
         .map(|part| {
-            let p = part.trim();
+            let p = py_trim(part);
             let b = p.as_bytes();
             let stripped = if b.len() >= 2 {
                 let (f, l) = (b[0], b[b.len() - 1]);
@@ -243,7 +251,7 @@ fn split_top_level(text: &str) -> Vec<String> {
     parts.push(current);
     parts
         .into_iter()
-        .map(|p| p.trim().to_string())
+        .map(|p| py_trim(&p).to_string())
         .filter(|p| !p.is_empty())
         .collect()
 }
@@ -264,9 +272,43 @@ fn split_keyword<'t>(text: &'t str, kw: &Regex) -> Option<(&'t str, &'t str)> {
     None
 }
 
+/// Python's `str.isspace()`, which is NOT Rust's `char::is_whitespace`.
+///
+/// Python additionally treats the C0 separators U+001C..U+001F (FILE, GROUP,
+/// RECORD, UNIT SEPARATOR) as whitespace; Rust's `is_whitespace` is the Unicode
+/// `White_Space` property, which excludes them. So `str.split()`/`str.strip()`
+/// and `split_whitespace()`/`trim()` disagree on exactly those four characters.
+///
+/// Measured: `GRANT SELECT\x1c ON t TO anon;` gave privileges `SELECT` from the
+/// Python arm and `SELECT\x1c` from this one. The kernel serves ~99% of SQL
+/// files, so production would silently take the divergent answer, and the parity
+/// harness could not see it because no corpus file contains a C0 separator.
+fn py_is_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// Python's `str.strip()`.
+fn py_trim(s: &str) -> &str {
+    s.trim_matches(py_is_space)
+}
+
 /// Python's `" ".join(s.split())`.
 fn collapse_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<&str>>().join(" ")
+    s.split(py_is_space)
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
+/// Blank `-- ...` to EQUAL-LENGTH spaces, preserving offsets and line count.
+///
+/// A grant can wrap across lines with a comment in the middle, and the comment
+/// text was landing in the parsed statement. Worse than cosmetic: a comment
+/// containing the word ON or TO moves where the clause splits.
+fn mask_line_comments(p: &Patterns, text: &str) -> String {
+    p.line_comment
+        .replace_all(text, |c: &regex::Captures| " ".repeat(c[0].len()))
+        .into_owned()
 }
 
 /// `_parse_grant`: split a GRANT/REVOKE body into (privileges, objects, roles).
@@ -276,7 +318,8 @@ fn collapse_ws(s: &str) -> String {
 /// guessed edge shipped as EXTRACTED at confidence 1.0, and a grant on a
 /// DATABASE has no object node to point at.
 fn parse_grant(p: &Patterns, verb: &str, body: &str) -> Option<(String, Vec<String>, Vec<String>)> {
-    let body = p.revoke_option_for.replace(body, "");
+    let masked = mask_line_comments(p, body);
+    let body = p.revoke_option_for.replace(&masked, "");
     // No ON => role membership (`GRANT admin TO alice`); both sides are roles,
     // so there is no object to carry a privilege edge.
     let (privileges_part, rest) = split_keyword(&body, &p.kw_on)?;
@@ -291,7 +334,7 @@ fn parse_grant(p: &Patterns, verb: &str, body: &str) -> Option<(String, Vec<Stri
         None => return None,
     };
 
-    let mut objects_part = objects_part.trim().to_string();
+    let mut objects_part = py_trim(objects_part).to_string();
     if let Some(cm) = p.tsql_securable_class.captures(&objects_part) {
         // T-SQL scopes by class: `OBJECT::t`, `TYPE::t`, `SCHEMA::s`. Only
         // OBJECT names something this graph holds.
@@ -299,7 +342,7 @@ fn parse_grant(p: &Patterns, verb: &str, body: &str) -> Option<(String, Vec<Stri
             return None;
         }
         let end = cm.get(0).unwrap().end();
-        objects_part = objects_part[end..].trim().to_string();
+        objects_part = py_trim(&objects_part[end..]).to_string();
     }
     let lowered = objects_part.to_lowercase();
     if UNGRAPHED_OBJECT_TYPES.iter().any(|t| lowered.starts_with(t)) {
@@ -309,14 +352,14 @@ fn parse_grant(p: &Patterns, verb: &str, body: &str) -> Option<(String, Vec<Stri
         if lowered.starts_with(&format!("{object_type} "))
             || lowered.starts_with(&format!("{object_type}\n"))
         {
-            objects_part = objects_part[object_type.len()..].trim().to_string();
+            objects_part = py_trim(&objects_part[object_type.len()..]).to_string();
             break;
         }
     }
 
     let mut objects: Vec<String> = Vec::new();
     for raw in split_top_level(&objects_part) {
-        let name = p.arg_list.replace(&raw, "").trim().to_string();
+        let name = py_trim(&p.arg_list.replace(&raw, "")).to_string();
         // `GRANT ... ON db_name.* TO x` (MySQL) names a whole database, not an
         // object, so there is nothing to point an edge at.
         if !name.is_empty() && !name.ends_with(".*") && p.object_name.is_match(&name) {
@@ -335,7 +378,7 @@ fn parse_grant(p: &Patterns, verb: &str, body: &str) -> Option<(String, Vec<Stri
     }
     let mut roles: Vec<String> = Vec::new();
     for raw in split_top_level(&roles_part) {
-        let name = p.role_qualifier.replace(&raw, "").trim().to_string();
+        let name = py_trim(&p.role_qualifier.replace(&raw, "")).to_string();
         if name.is_empty() {
             continue;
         }
@@ -361,6 +404,8 @@ fn parse_grant(p: &Patterns, verb: &str, body: &str) -> Option<(String, Vec<Stri
 /// expressions that can contain the words FOR and TO, and can name tables the
 /// policy does not "apply to" in any sense worth an edge.
 fn parse_policy(p: &Patterns, rest: &str) -> (Option<String>, Vec<String>) {
+    let rest = mask_line_comments(p, rest);
+    let rest = rest.as_str();
     let head = match p.policy_body.find(rest) {
         Some(m) => &rest[..m.start()],
         None => rest,
@@ -373,7 +418,7 @@ fn parse_policy(p: &Patterns, rest: &str) -> (Option<String>, Vec<String>) {
     let mut roles: Vec<String> = Vec::new();
     if let Some((_, roles_part)) = split_keyword(head, &p.kw_to) {
         for raw in split_top_level(roles_part) {
-            let name = p.role_qualifier.replace(&raw, "").trim().to_string();
+            let name = py_trim(&p.role_qualifier.replace(&raw, "")).to_string();
             if let Some(rm) = p.role_name.captures(&name) {
                 roles.push(rm[1].to_string());
             }

@@ -11,8 +11,13 @@ from graphify.extractors.base import _file_stem, _make_id
 # A GRANT/REVOKE statement, anchored at line start and running to the first `;`.
 # DOTALL because the statement routinely wraps across lines (a function signature
 # with several parameter types is the common case).
+# `(?:;|\Z)`, not just `;`: the LAST statement in a file often has no
+# terminator, and requiring one silently dropped 9 real GRANT/REVOKEs across the
+# two SQL corpora. When there is no `;` the body runs to end of input, and a body
+# that swallowed unrelated trailing SQL fails the role/object patterns and emits
+# nothing -- fail-closed, which is the right direction here.
 _GRANT_STMT = re.compile(
-    r"^[ \t]*(GRANT|REVOKE)\b(?P<body>.*?);",
+    r"^[ \t]*(GRANT|REVOKE)\b(?P<body>.*?)(?:;|\Z)",
     re.IGNORECASE | re.MULTILINE | re.DOTALL,
 )
 
@@ -69,6 +74,24 @@ _REVOKE_OPTION_FOR = re.compile(r"^\s*(?:GRANT|ADMIN)\s+OPTION\s+FOR\b", re.IGNO
 _ROLE_QUALIFIER = re.compile(r"^(?:GROUP|ROLE|USER)\s+", re.IGNORECASE)
 
 
+_LINE_COMMENT = re.compile(r"--[^\n]*")
+
+
+def _mask_line_comments(text: str) -> str:
+    """Blank `-- ...` to EQUAL-LENGTH spaces, preserving offsets and line count.
+
+    A grant can wrap across lines with a comment in the middle, and the comment
+    text was landing in the parsed statement: `GRANT SELECT -- grant to nobody`
+    reported privileges `SELECT -- GRANT TO NOBODY`. Worse than cosmetic -- a
+    comment containing the word ON or TO moves where the clause splits, so the
+    object and role lists come out of the wrong slice of text.
+
+    Equal-length spaces rather than deletion so byte offsets stay usable, the
+    same trick the ObjC walker uses for `NS_ASSUME_NONNULL_BEGIN`.
+    """
+    return _LINE_COMMENT.sub(lambda m: " " * len(m.group(0)), text)
+
+
 def _split_top_level(text: str) -> list[str]:
     """Split on commas that are not inside parentheses.
 
@@ -114,7 +137,7 @@ def _split_keyword(text: str, keyword: str) -> tuple[str, str] | None:
 _POLICY_STMT = re.compile(
     r"^[ \t]*CREATE\s+POLICY\s+(?P<name>" + _PART + r")"
     r"\s+ON\s+(?P<table>" + _PART + r"(?:\s*\.\s*" + _PART + r")*)"
-    r"(?P<rest>.*?);",
+    r"(?P<rest>.*?)(?:;|\Z)",
     re.IGNORECASE | re.MULTILINE | re.DOTALL,
 )
 # The clauses that end the role/command header and begin the expressions.
@@ -134,6 +157,7 @@ def _parse_policy(rest: str) -> tuple[str | None, list[str]]:
     SQL expressions that can contain the words FOR and TO, and can name tables
     this policy does not "apply to" in any sense worth an edge.
     """
+    rest = _mask_line_comments(rest)
     body = _POLICY_BODY.search(rest)
     head = rest[: body.start()] if body else rest
 
@@ -158,7 +182,7 @@ def _parse_grant(verb: str, body: str) -> tuple[str, list[str], list[str]] | Non
     replaces is a guessed edge presented as EXTRACTED at confidence 1.0, and a
     grant on a DATABASE has no object node to point at.
     """
-    body = _REVOKE_OPTION_FOR.sub("", body)
+    body = _REVOKE_OPTION_FOR.sub("", _mask_line_comments(body))
     # No ON => role membership (`GRANT admin TO alice`). Both sides are roles,
     # so there is no object to hang a privilege edge on.
     split_on = _split_keyword(body, "ON")

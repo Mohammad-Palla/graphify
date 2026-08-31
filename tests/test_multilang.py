@@ -1107,3 +1107,74 @@ def test_qualified_rewire_requires_an_exact_label_match(tmp_path):
     ids = {n["label"]: n["id"] for n in result["nodes"]
            if n["label"] in ("publicaccount", "public.account")}
     assert ids["publicaccount"] != ids["public.account"]
+
+
+def test_sql_grant_without_trailing_semicolon_is_parsed(tmp_path):
+    """The last statement in a file often has no terminator.
+
+    Requiring `;` silently dropped 9 real GRANT/REVOKEs across the two SQL
+    corpora, so the statement may also end at end-of-input.
+    """
+    pytest.importorskip("tree_sitter_sql")
+    (tmp_path / "m.sql").write_text(
+        "CREATE TABLE t (id int);\nGRANT SELECT ON t TO anon\n", encoding="utf-8")
+    edges = _grant_edges(extract_sql(tmp_path / "m.sql"))
+    assert [(t, r, p) for _, t, r, p in edges] == [
+        ("sql_role_anon", "grants_to", "SELECT")]
+
+
+def test_sql_policy_without_trailing_semicolon_is_parsed(tmp_path):
+    pytest.importorskip("tree_sitter_sql")
+    (tmp_path / "p.sql").write_text(
+        "CREATE TABLE t (id int);\nCREATE POLICY p ON t USING (true)\n",
+        encoding="utf-8")
+    rels = {e["relation"] for e in _policy_edges(extract_sql(tmp_path / "p.sql"))}
+    assert rels == {"secures", "applies_to"}
+
+
+def test_sql_comment_inside_a_grant_is_not_part_of_the_statement(tmp_path):
+    """A grant can wrap across lines with a comment in the middle.
+
+    Worse than cosmetic: the comment text was landing in the parsed statement,
+    so a comment containing the word ON or TO moved where the clause splits and
+    the object and role lists came out of the wrong slice of text.
+    """
+    pytest.importorskip("tree_sitter_sql")
+    (tmp_path / "m.sql").write_text(
+        "CREATE TABLE t (id int);\n"
+        "GRANT SELECT\n  -- grant to nobody ON x\n  ON t TO anon;\n",
+        encoding="utf-8")
+    edges = _grant_edges(extract_sql(tmp_path / "m.sql"))
+    assert [(t, r, p) for _, t, r, p in edges] == [
+        ("sql_role_anon", "grants_to", "SELECT")]
+
+
+def test_sql_policy_comment_cannot_inject_a_role(tmp_path):
+    pytest.importorskip("tree_sitter_sql")
+    (tmp_path / "p.sql").write_text(
+        "CREATE TABLE t (id int);\n"
+        "CREATE POLICY p ON t -- TO evil\n  FOR SELECT TO anon USING (x);\n",
+        encoding="utf-8")
+    roles = {e["target"] for e in _policy_edges(extract_sql(tmp_path / "p.sql"))
+             if e["relation"] == "applies_to"}
+    assert roles == {"sql_role_anon"}
+
+
+def test_sql_c0_separators_are_whitespace_like_python(tmp_path):
+    """Python's `str.split()`/`strip()` treat U+001C..U+001F as whitespace; Rust's
+    `split_whitespace()`/`trim()` do not, because those are not in the Unicode
+    `White_Space` property.
+
+    That made the kernel and the Python reference disagree -- `GRANT SELECT\\x1c
+    ON t TO anon;` gave privileges `SELECT` from Python and `SELECT\\x1c` from the
+    kernel. The kernel serves ~99% of SQL files, so production silently took the
+    divergent answer, and the parity harness could not see it because no corpus
+    file contains a C0 separator.
+    """
+    pytest.importorskip("tree_sitter_sql")
+    (tmp_path / "m.sql").write_text(
+        "CREATE TABLE t (id int);\nGRANT SELECT\x1c ON t\x1c TO anon\x1c;\n",
+        encoding="utf-8")
+    edges = _grant_edges(extract_sql(tmp_path / "m.sql"))
+    assert [(t, r, p) for _, t, r, p in edges] == [
+        ("sql_role_anon", "grants_to", "SELECT")]
