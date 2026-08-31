@@ -41,9 +41,19 @@ def _py_grammar_fingerprint(language):
 
     from graphify.extractors.kernel import _LANGUAGE_TO_GRAMMAR
 
+    from graphify.extractors.kernel import _names_digest
+
     module_name, fn_name = _LANGUAGE_TO_GRAMMAR[language]
     lang = Language(getattr(importlib.import_module(module_name), fn_name)())
-    return (lang.abi_version, lang.node_kind_count, lang.field_count)
+    # `(abi, kind_names_digest, field_names_digest)`. The digests are what the
+    # check compares; `abi` is carried for diagnostics only. Computed through the
+    # SAME helper the seam uses, so this fake cannot drift into agreeing with a
+    # comparison that the real kernel would fail.
+    return (
+        lang.abi_version,
+        _names_digest(lang.node_kind_for_id(i) for i in range(lang.node_kind_count)),
+        _names_digest(lang.field_name_for_id(i) for i in range(lang.field_count + 1)),
+    )
 
 
 def _fake_kernel(*, languages=(), tree_sitter_ok=True, extract=None, version="0.1.0",
@@ -554,4 +564,45 @@ def test_seam_passes_every_resolver_the_kernel_takes(tmp_path, monkeypatch):
     assert seen[0] == expected, (
         f"the seam passes {seen[0]} arguments but extract_file declares "
         f"{expected}; a resolver slot is being left to its None default"
+    )
+
+
+def test_every_supported_language_is_reachable():
+    """A language the kernel claims to support must actually be routable.
+
+    This is the guard for a failure that already happened, to six languages at
+    once, and that every other gate reported as a PASS.
+
+    A BESPOKE walker reaches the kernel through `BespokeGrammar`, which supplies
+    a `(ts_module, ts_language_fn)` pair for `language_for` to look up in
+    `_GRAMMAR_TO_LANGUAGE`. Registering the walker in `languages.rs` is therefore
+    only HALF of shipping it. With the Python-side entry missing, `language_for`
+    returns None, `try_extract` defers before loading the kernel at all, and the
+    parity harness still passes (it calls `extract_file` directly) while the
+    quality gate compares Python against Python and reports "identical".
+
+    So: for every language the kernel reports as supported, assert both that the
+    reverse map knows it AND that `_load()` left it enabled -- the second catches
+    a grammar the fingerprint rejected, the first catches an unreachable walker.
+    """
+    kernel_mod = pytest.importorskip("graphify_kernel",
+                                     reason="native kernel not built")
+    from graphify.extractors import kernel as kseam
+
+    kseam._load()
+    if kseam.status() != "ok":
+        pytest.skip(f"kernel not loaded: {kseam.status()}")
+
+    supported = set(kernel_mod.supported_languages())
+    enabled = set(kseam.enabled_languages())
+    unroutable = sorted(
+        lang for lang in supported if lang not in kseam._LANGUAGE_TO_GRAMMAR
+    )
+    assert not unroutable, (
+        "these languages have a native walker but no _GRAMMAR_TO_LANGUAGE entry, "
+        f"so try_extract can never reach them: {unroutable}"
+    )
+    assert supported == enabled, (
+        "supported but not enabled (grammar fingerprint rejected them): "
+        f"{sorted(supported - enabled)}"
     )

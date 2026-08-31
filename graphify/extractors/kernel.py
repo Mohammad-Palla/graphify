@@ -72,6 +72,20 @@ _GRAMMAR_TO_LANGUAGE: dict[tuple[str, str], str] = {
     ("tree_sitter_swift", "language"): "swift",
     ("tree_sitter_ocaml", "language_ocaml"): "ocaml",
     ("tree_sitter_ocaml", "language_ocaml_interface"): "ocaml_interface",
+    # BESPOKE walkers still need an entry here. They reach the kernel through
+    # `BespokeGrammar`, which supplies exactly this `(ts_module, ts_language_fn)`
+    # pair for `language_for` to look up -- so a walker registered in
+    # `languages.rs` but MISSING here is silently unreachable: `language_for`
+    # returns None, `try_extract` defers before it even loads the kernel, and
+    # every gate still passes because Python is then compared against Python.
+    # `tests/test_kernel_seam.py::test_every_supported_language_is_reachable`
+    # exists because that happened to six languages at once.
+    ("tree_sitter_zig", "language"): "zig",
+    ("tree_sitter_elixir", "language"): "elixir",
+    ("tree_sitter_julia", "language"): "julia",
+    ("tree_sitter_fortran", "language"): "fortran",
+    ("tree_sitter_objc", "language"): "objc",
+    ("tree_sitter_powershell", "language"): "powershell",
 }
 
 # The reverse map, for the grammar-version check below: kernel language key ->
@@ -158,13 +172,40 @@ def _load() -> Any | None:
     return mod
 
 
+def _names_digest(names) -> str:
+    """SHA-256 over grammar names, ``\0``-joined in id order.
+
+    Must stay byte-for-byte identical to `names_digest` in `languages.rs`: join
+    with ``\0``, hash the UTF-8 bytes, lowercase hex. A missing name is the empty
+    string.
+    """
+    import hashlib
+
+    joined = "\0".join(n or "" for n in names)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
 def _grammar_matches(language: str, kernel_fp: tuple | None) -> bool:
     """Whether the kernel's grammar for `language` is the one Python loads.
 
-    Compared on ``(abi_version, node_kind_count, field_count)``. ABI version alone
-    is far too coarse -- many grammar revisions share ABI 15 -- while the kind and
-    field counts move with essentially any revision, which is what makes the triple
-    a usable stand-in for "same grammar".
+    Compared on the DIGESTS of the full symbol tables -- every node-kind name by
+    id and every field name by id -- not on their counts.
+
+    That is strictly stronger than the old
+    ``(abi_version, node_kind_count, field_count)``: a grammar revision that adds
+    one kind and removes another keeps both counts and so passed silently, while
+    parsing differently. The digests pin the whole table, name for name.
+
+    ``abi_version`` is deliberately NOT compared, and the reason is measured.
+    ABI is a property of the tree-sitter CLI that generated the parser, not of
+    the grammar. PyPI ``tree-sitter-sql`` 0.3.11 is ABI 15 while the crate
+    ``tree-sitter-sequel`` 0.3.11 is ABI 14, with all 729 kind names and 54 field
+    names identical by id; parsing all 3,442 postgres + sqlfluff files with both
+    and comparing a preorder digest of every node (kind, byte range, MISSING and
+    ERROR flags) gave 3,442 identical trees out of 3,442, including all 2,797
+    files containing ERROR nodes. Gating on ABI would reject that while adding no
+    protection the digests do not already provide. The real safety net is
+    per-language and unchanged: a DIVERGENT-0 parity run over real corpora.
     """
     if kernel_fp is None:
         return False
@@ -179,10 +220,18 @@ def _grammar_matches(language: str, kernel_fp: tuple | None) -> bool:
 
         mod = importlib.import_module(module_name)
         lang = Language(getattr(mod, fn_name)())
-        py_fp = (lang.abi_version, lang.node_kind_count, lang.field_count)
+        kinds = _names_digest(
+            lang.node_kind_for_id(i) for i in range(lang.node_kind_count)
+        )
+        fields = _names_digest(
+            lang.field_name_for_id(i) for i in range(lang.field_count + 1)
+        )
     except Exception:
         return False
-    return tuple(kernel_fp) == py_fp
+    # kernel_fp is (abi, kinds_digest, fields_digest); abi is diagnostic only.
+    if len(kernel_fp) != 3:
+        return False
+    return (kernel_fp[1], kernel_fp[2]) == (kinds, fields)
 
 
 def status() -> str:

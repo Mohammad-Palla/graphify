@@ -177,9 +177,10 @@ fn selftest<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
     out.set_item("languages", PyList::new(py, languages::supported())?)?;
     // Prove the tree-sitter link is live, not just that the module loaded.
     out.set_item("tree_sitter_ok", languages::grammar_smoke_test())?;
-    // language -> (abi_version, node_kind_count, field_count), so `kernel.py` can
-    // refuse any language whose grammar does not match the one Python loads. See
-    // `languages::grammar_fingerprints` for why this is not optional.
+    // language -> (abi_version, kind_names_digest, field_names_digest), so
+    // `kernel.py` can refuse any language whose grammar does not match the one
+    // Python loads. The DIGESTS are the gate; `abi_version` is diagnostic only.
+    // See `languages::grammar_fingerprints` for why, and for the measurement.
     let fps = PyDict::new(py);
     for (name, abi, kinds, fields) in languages::grammar_fingerprints() {
         fps.set_item(name, (abi, kinds, fields))?;

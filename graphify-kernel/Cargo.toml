@@ -58,6 +58,17 @@ tree-sitter-powershell = "0.26.4"
 # `_csharp_namespace_id` is `sha1(dotted_name).hexdigest()[:16]`, so the digest
 # is part of the node id and has to be the real thing.
 sha1 = "0.10"
+# The grammar fingerprint digests. SHA-256 rather than reusing sha1: this is a
+# change-detection digest whose collisions would silently route a mismatched
+# grammar, so it gets the stronger hash.
+sha2 = "0.10"
+# `extract_sql` is majority REGEX RECOVERY, not tree walking: tree-sitter-sql
+# leaves an ERROR node on 81.5% of real files (PL/pgSQL bodies, dialect syntax),
+# and the extractor has nine patterns that rebuild the dropped objects from raw
+# text. Nine patterns with case-insensitive alternation and nested groups is well
+# past the point where hand-rolling is safer than a real engine -- `lua/`
+# hand-rolls its ONE `require` pattern precisely because it is one.
+regex = "1"
 
 [profile.release]
 opt-level = 3

@@ -273,10 +273,36 @@ pub fn walker_for(language: &str) -> Option<Walker> {
 /// signal. So the version agreement is checked at load time and a mismatch
 /// disables that language.
 ///
-/// `abi_version` alone is far too coarse (many grammar revisions share ABI 15).
-/// The node-kind and field counts change with essentially any grammar revision,
-/// which is what makes the triple a usable proxy for "same grammar".
-pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
+/// # What is compared, and why it changed
+///
+/// This used to be `(abi_version, node_kind_count, field_count)`. It is now
+/// `(abi_version, kind_names_digest, field_names_digest)` -- a SHA-256 over
+/// every node-kind name by id and every field name by id.
+///
+/// That is strictly stronger on the question actually being asked. The counts
+/// were a proxy: a grammar revision that ADDS one kind and REMOVES another
+/// passes a count comparison silently while parsing differently. The digests
+/// cannot: they pin the whole symbol table, name for name, in id order.
+///
+/// The ABI version is still reported but is NO LONGER part of the match, and
+/// that is a deliberate, measured decision. ABI is a property of the
+/// tree-sitter CLI that GENERATED the parser, not of the grammar -- so it
+/// blocked a legitimate case:
+///
+/// > PyPI `tree-sitter-sql` 0.3.11 is ABI 15 and the crate `tree-sitter-sequel`
+/// > 0.3.11 is ABI 14. All 729 kind names and all 54 field names are identical
+/// > by id. Parsing all 3,442 files of postgres + sqlfluff with BOTH and
+/// > comparing a preorder digest of EVERY node (kind, byte range, MISSING and
+/// > ERROR flags) gives **3,442 identical trees out of 3,442 -- including all
+/// > 2,797 files that contain ERROR nodes.** Error recovery is identical too.
+///
+/// Keeping ABI in the gate would reject that while adding no protection the
+/// digests do not already give: two different grammar REVISIONS with identical
+/// symbol tables (a precedence-only change) are invisible to ABI as well, since
+/// ABI moves with the CLI and not the grammar. The real safety net is unchanged
+/// and is per-language: every routed language is gated by a DIVERGENT-0 parity
+/// run over real corpora.
+pub fn grammar_fingerprints() -> Vec<(&'static str, u32, String, String)> {
     let langs: [(&'static str, tree_sitter::Language); 26] = [
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
@@ -311,11 +337,28 @@ pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
             (
                 *name,
                 l.abi_version() as u32,
-                l.node_kind_count() as u32,
-                l.field_count() as u32,
+                names_digest((0..l.node_kind_count()).map(|i| l.node_kind_for_id(i as u16))),
+                names_digest((0..=l.field_count()).map(|i| l.field_name_for_id(i as u16))),
             )
         })
         .collect()
+}
+
+/// SHA-256 over the grammar's names, `\0`-joined in id order, with a missing
+/// name written as the empty string.
+///
+/// The Python side computes this byte for byte the same way; the two must be
+/// edited together, so the recipe is spelled out rather than left implicit:
+/// join with `\0`, hash the UTF-8 bytes, lowercase hex.
+fn names_digest<'x>(names: impl Iterator<Item = Option<&'x str>>) -> String {
+    use sha2::Digest as _;
+    let joined = names
+        .map(|n| n.unwrap_or(""))
+        .collect::<Vec<&str>>()
+        .join("\0");
+    let mut h = sha2::Sha256::new();
+    h.update(joined.as_bytes());
+    format!("{:x}", h.finalize())
 }
 
 /// Parse a trivial TypeScript source to prove the grammar is linked and
