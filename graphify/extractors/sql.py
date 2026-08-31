@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 
 from pathlib import Path
+from graphify.extractors import kernel as _kernel
 from graphify.extractors.base import _file_stem, _make_id
 
 
@@ -27,8 +28,21 @@ def _norm_ident(name: str) -> str:
     return ".".join(parts)
 
 
+_KERNEL_GRAMMAR = _kernel.BespokeGrammar("tree_sitter_sql")
+
+
 def extract_sql(path: Path, content: str | bytes | None = None) -> dict:
     """Extract tables, views, functions, and relationships from .sql files via tree-sitter."""
+    # `content` is supplied by the --postgres introspection path, which
+    # reconstructs DDL in memory rather than reading a file; pass it through as
+    # `source_override` so the kernel walks the same bytes.
+    native = _kernel.try_extract(
+        path, _KERNEL_GRAMMAR,
+        source_override=(content.encode("utf-8") if isinstance(content, str)
+                         else content),
+    )
+    if native is not None:
+        return native
     try:
         import tree_sitter_sql as tssql
         from tree_sitter import Language, Parser

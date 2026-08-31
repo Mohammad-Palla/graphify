@@ -55,6 +55,12 @@ tree-sitter-fortran = "0.6.0"
 tree-sitter-objc = "3.0.2"
 # Bespoke walker. Crate and PyPI package are both 0.26.4.
 tree-sitter-powershell = "0.26.4"
+# The SAME grammar as PyPI `tree-sitter-sql` 0.3.11, renamed on crates.io because
+# `tree-sitter-sql` was taken. Verified: identical 729 kind names and 54 field
+# names by id, and 3,442/3,442 identical parse trees on postgres+sqlfluff. Only
+# the generated ABI differs (14 here vs 15 there), which is why the fingerprint
+# compares symbol-table digests rather than ABI.
+tree-sitter-sequel = "0.3.11"
 # `_csharp_namespace_id` is `sha1(dotted_name).hexdigest()[:16]`, so the digest
 # is part of the node id and has to be the real thing.
 sha1 = "0.10"

@@ -1433,7 +1433,26 @@ def test_rebuild_refuses_loss_from_failed_source(tmp_path, monkeypatch, no_clust
     )
     existing = {"nodes": existing_nodes, "links": []}
     graph_path.write_text(json.dumps(existing), encoding="utf-8")
+    # An unimportable `tree_sitter_sql` must make extraction FAIL, which is what
+    # this test is about. The native kernel links its own SQL grammar, so it would
+    # otherwise extract the file happily and there would be no loss to refuse --
+    # a real improvement, but not the path under test.
+    #
+    # The kernel decides which languages it may serve ONCE, at load time, by
+    # comparing each grammar against the one Python loads; a grammar it cannot
+    # import is dropped there (fails CLOSED). Production order is therefore
+    # "grammar missing, then kernel loads, then SQL is disabled" -- so reset the
+    # cached load state and let that really happen, rather than stubbing the
+    # kernel out and testing a path that no longer exists.
+    from graphify.extractors import kernel as _kseam
+
     monkeypatch.setitem(sys.modules, "tree_sitter_sql", None)
+    monkeypatch.setattr(_kseam, "_loaded", False)
+    monkeypatch.setattr(_kseam, "_kernel", None)
+    monkeypatch.setattr(_kseam, "_status", "not_loaded")
+    assert "sql" not in _kseam.enabled_languages(), (
+        "the kernel must drop SQL when its Python grammar cannot be imported"
+    )
 
     ok = _rebuild_code(tmp_path, force=False, no_cluster=no_cluster)
 

@@ -105,7 +105,18 @@ pub type Walker = for<'py> fn(
 /// powershell powershell    507   64.1%     35.9%          0
 /// poshgit  powershell       32   50.0%     50.0%          0
 /// psreadline powershell      9   33.3%     66.7%          0
+/// sqlfluff sql            400   99.8%      0.2%          0
+/// sqlfluff sql (rest)    2187  100.0%      0.0%          0
+/// postgres sql            855   99.1%      0.9%          0
 /// ```
+///
+/// **SQL's rate is the one to read against its ceiling.** Its parse ceiling is
+/// 18.5% -- tree-sitter-sql leaves an ERROR node in four files out of five -- and
+/// it is nonetheless 99%+ native, because `sql/` is the one walker here that does
+/// NOT defer on `has_error`. `extract_sql` is BUILT around errored trees (an
+/// `ERROR` branch, a `fb_proc_or_trigger` branch, two whole-file regex
+/// fallbacks), so deferring would have routed almost nothing. See `sql/mod.rs`
+/// for the 3,442-file tree-identity measurement that justifies walking them.
 ///
 /// **Read Fortran's three rows together or not at all.** The aggregate ceiling
 /// over those corpora is 12.5% and it is meaningless: split by EXTENSION, `.f90`
@@ -209,7 +220,7 @@ pub fn supported() -> Vec<&'static str> {
         "typescript", "tsx", "javascript", "python", "java", "csharp", "c", "cpp",
         "php", "bash", "go", "rust", "ruby", "kotlin", "lua", "scala",
         "swift", "zig", "elixir", "ocaml", "ocaml_interface", "julia",
-        "fortran", "objc", "powershell",
+        "fortran", "objc", "powershell", "sql",
     ]
 }
 
@@ -250,6 +261,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
         "julia" => Some(crate::julia::walk_julia),
         "objc" => Some(crate::objc::walk_objc),
         "powershell" => Some(crate::powershell::walk_powershell),
+        "sql" => Some(crate::sql::walk_sql),
         "ocaml" => Some(crate::ocaml::walk_ocaml),
         "ocaml_interface" => Some(crate::ocaml::walk_ocaml_interface),
         _ => None,
@@ -303,7 +315,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
 /// and is per-language: every routed language is gated by a DIVERGENT-0 parity
 /// run over real corpora.
 pub fn grammar_fingerprints() -> Vec<(&'static str, u32, String, String)> {
-    let langs: [(&'static str, tree_sitter::Language); 26] = [
+    let langs: [(&'static str, tree_sitter::Language); 27] = [
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ("javascript", tree_sitter_javascript::LANGUAGE.into()),
@@ -328,6 +340,7 @@ pub fn grammar_fingerprints() -> Vec<(&'static str, u32, String, String)> {
         ("fortran", tree_sitter_fortran::LANGUAGE.into()),
         ("objc", tree_sitter_objc::LANGUAGE.into()),
         ("powershell", tree_sitter_powershell::LANGUAGE.into()),
+        ("sql", tree_sitter_sequel::LANGUAGE.into()),
         ("ocaml", tree_sitter_ocaml::LANGUAGE_OCAML.into()),
         ("ocaml_interface", tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE.into()),
     ];

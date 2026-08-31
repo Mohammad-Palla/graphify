@@ -86,6 +86,7 @@ _GRAMMAR_TO_LANGUAGE: dict[tuple[str, str], str] = {
     ("tree_sitter_fortran", "language"): "fortran",
     ("tree_sitter_objc", "language"): "objc",
     ("tree_sitter_powershell", "language"): "powershell",
+    ("tree_sitter_sql", "language"): "sql",
 }
 
 # The reverse map, for the grammar-version check below: kernel language key ->

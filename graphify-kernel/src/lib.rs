@@ -46,6 +46,7 @@ mod julia;
 mod objc;
 mod powershell;
 mod ocaml;
+mod sql;
 mod swift;
 mod zig;
 mod rust;

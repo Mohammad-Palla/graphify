@@ -3708,6 +3708,21 @@ def test_extract_warns_when_sql_extra_missing(tmp_path, capsys, monkeypatch):
     # the #1666 warning skips it too. The files must not vanish silently:
     # extract() surfaces them with the [sql] extra named.
     monkeypatch.setitem(sys.modules, "tree_sitter_sql", None)  # import -> ImportError
+    # The kernel links its own SQL grammar, and it decides which languages it may
+    # serve ONCE, at load time, by comparing each against the grammar Python
+    # loads -- dropping any it cannot import (failing CLOSED). Production order is
+    # therefore "extra absent, then kernel loads, then SQL is disabled", so reset
+    # the cached load state and let that really happen. Testing it this way rather
+    # than stubbing `try_extract` keeps the assertion honest: it proves the
+    # warning still fires through the REAL routing decision.
+    from graphify.extractors import kernel as _kseam
+
+    monkeypatch.setattr(_kseam, "_loaded", False)
+    monkeypatch.setattr(_kseam, "_kernel", None)
+    monkeypatch.setattr(_kseam, "_status", "not_loaded")
+    assert "sql" not in _kseam.enabled_languages(), (
+        "the kernel must drop SQL when its Python grammar cannot be imported"
+    )
     s1 = tmp_path / "schema.sql"; s1.write_text("CREATE TABLE users (id INT);\n")
     s2 = tmp_path / "views.sql"; s2.write_text("CREATE VIEW v AS SELECT * FROM users;\n")
     py = tmp_path / "main.py"; py.write_text("def main():\n    return 1\n")
@@ -3763,6 +3778,25 @@ def test_extract_sql_reports_load_failure_not_missing(tmp_path, monkeypatch):
         return _orig_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", _broken_import)
+    # The native kernel links its OWN SQL grammar, so it would extract this
+    # happily and there would be no error to assert. This test is about the
+    # PYTHON fallback's error MESSAGE -- that a present-but-broken grammar
+    # reports the real cause, not the misleading "install the extra" hint -- so
+    # the kernel is taken out of the way deliberately.
+    #
+    # `_broken_import` alone does NOT stop it: the kernel's load-time grammar
+    # check uses `importlib.import_module`, which does not go through
+    # `builtins.__import__`.
+    #
+    # Not papering over a gap. The kernel drops any language whose Python grammar
+    # it cannot import, at load time and failing CLOSED, so a genuinely broken
+    # grammar still reaches this path in production. That routing interaction is
+    # covered for real by
+    # `test_watch.py::test_rebuild_refuses_loss_from_failed_source`, which resets
+    # the kernel's cached load state and asserts SQL is actually disabled.
+    from graphify.extractors import kernel as _kseam
+
+    monkeypatch.setattr(_kseam, "try_extract", lambda *a, **kw: None)
     err = extract_sql(tmp_path / "schema.sql", "SELECT 1;").get("error") or ""
     assert "failed to load" in err
     assert "dynamic module does not define module export function" in err
@@ -3784,6 +3818,25 @@ def test_extract_warns_sql_grammar_failed_to_load(tmp_path, capsys, monkeypatch)
         return _orig_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", _broken_import)
+    # The native kernel links its OWN SQL grammar, so it would extract this
+    # happily and there would be no error to assert. This test is about the
+    # PYTHON fallback's error MESSAGE -- that a present-but-broken grammar
+    # reports the real cause, not the misleading "install the extra" hint -- so
+    # the kernel is taken out of the way deliberately.
+    #
+    # `_broken_import` alone does NOT stop it: the kernel's load-time grammar
+    # check uses `importlib.import_module`, which does not go through
+    # `builtins.__import__`.
+    #
+    # Not papering over a gap. The kernel drops any language whose Python grammar
+    # it cannot import, at load time and failing CLOSED, so a genuinely broken
+    # grammar still reaches this path in production. That routing interaction is
+    # covered for real by
+    # `test_watch.py::test_rebuild_refuses_loss_from_failed_source`, which resets
+    # the kernel's cached load state and asserts SQL is actually disabled.
+    from graphify.extractors import kernel as _kseam
+
+    monkeypatch.setattr(_kseam, "try_extract", lambda *a, **kw: None)
     s1 = tmp_path / "schema.sql"; s1.write_text("CREATE TABLE users (id INT);\n")
     s2 = tmp_path / "views.sql"; s2.write_text("CREATE VIEW v AS SELECT * FROM users;\n")
 
