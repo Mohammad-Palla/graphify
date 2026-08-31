@@ -5,11 +5,18 @@ import re
 
 from pathlib import Path
 from typing import Any
+from graphify.extractors import kernel as _kernel
 from graphify.extractors.base import _file_stem, _make_id, _read_text
+
+
+_KERNEL_GRAMMAR = _kernel.BespokeGrammar("tree_sitter_powershell")
 
 
 def extract_powershell(path: Path) -> dict:
     """Extract functions, classes, methods, and using statements from a .ps1 file."""
+    native = _kernel.try_extract(path, _KERNEL_GRAMMAR)
+    if native is not None:
+        return native
     try:
         import tree_sitter_powershell as tsps
         from tree_sitter import Language, Parser

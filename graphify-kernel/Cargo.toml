@@ -53,6 +53,8 @@ tree-sitter-julia = "0.23.1"
 tree-sitter-fortran = "0.6.0"
 # Bespoke walker. Crate and PyPI package are both 3.0.2.
 tree-sitter-objc = "3.0.2"
+# Bespoke walker. Crate and PyPI package are both 0.26.4.
+tree-sitter-powershell = "0.26.4"
 # `_csharp_namespace_id` is `sha1(dotted_name).hexdigest()[:16]`, so the digest
 # is part of the node id and has to be the real thing.
 sha1 = "0.10"

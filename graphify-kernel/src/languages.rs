@@ -102,6 +102,9 @@ pub type Walker = for<'py> fn(
 /// afnetworking objc         79   87.3%     12.7%          0
 /// sdwebimage objc          262   82.1%     17.9%          0
 /// texture  objc            844   67.5%     32.5%          0
+/// powershell powershell    507   64.1%     35.9%          0
+/// poshgit  powershell       32   50.0%     50.0%          0
+/// psreadline powershell      9   33.3%     66.7%          0
 /// ```
 ///
 /// **Read Fortran's three rows together or not at all.** The aggregate ceiling
@@ -206,7 +209,7 @@ pub fn supported() -> Vec<&'static str> {
         "typescript", "tsx", "javascript", "python", "java", "csharp", "c", "cpp",
         "php", "bash", "go", "rust", "ruby", "kotlin", "lua", "scala",
         "swift", "zig", "elixir", "ocaml", "ocaml_interface", "julia",
-        "fortran", "objc",
+        "fortran", "objc", "powershell",
     ]
 }
 
@@ -246,6 +249,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
         "fortran" => Some(crate::fortran::walk_fortran),
         "julia" => Some(crate::julia::walk_julia),
         "objc" => Some(crate::objc::walk_objc),
+        "powershell" => Some(crate::powershell::walk_powershell),
         "ocaml" => Some(crate::ocaml::walk_ocaml),
         "ocaml_interface" => Some(crate::ocaml::walk_ocaml_interface),
         _ => None,
@@ -273,7 +277,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
 /// The node-kind and field counts change with essentially any grammar revision,
 /// which is what makes the triple a usable proxy for "same grammar".
 pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
-    let langs: [(&'static str, tree_sitter::Language); 25] = [
+    let langs: [(&'static str, tree_sitter::Language); 26] = [
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ("javascript", tree_sitter_javascript::LANGUAGE.into()),
@@ -297,6 +301,7 @@ pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
         ("julia", tree_sitter_julia::LANGUAGE.into()),
         ("fortran", tree_sitter_fortran::LANGUAGE.into()),
         ("objc", tree_sitter_objc::LANGUAGE.into()),
+        ("powershell", tree_sitter_powershell::LANGUAGE.into()),
         ("ocaml", tree_sitter_ocaml::LANGUAGE_OCAML.into()),
         ("ocaml_interface", tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE.into()),
     ];

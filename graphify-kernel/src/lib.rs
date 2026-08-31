@@ -44,6 +44,7 @@ mod elixir;
 mod fortran;
 mod julia;
 mod objc;
+mod powershell;
 mod ocaml;
 mod swift;
 mod zig;
