@@ -1081,6 +1081,7 @@ pub fn engine_configs() -> Vec<&'static EngineConfig> {
         &crate::kotlin::CONFIG,
         &crate::lua::CONFIG,
         &crate::groovy::CONFIG,
+        &crate::scala::CONFIG,
     ]
 }
 

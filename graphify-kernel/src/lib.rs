@@ -39,6 +39,7 @@ mod go;
 mod groovy;
 mod php;
 mod ruby;
+mod scala;
 mod rust;
 mod java;
 mod kotlin;

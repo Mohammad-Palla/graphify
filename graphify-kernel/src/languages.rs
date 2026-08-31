@@ -79,7 +79,14 @@ pub type Walker = for<'py> fn(
 /// kong     lua           1309   99.9%      0.1%          0
 /// neovim   lua            844   99.6%      0.4%          0
 /// luals    lua            479  100.0%      0.0%          0
+/// cats     scala          835   95.6%      4.4%          0
+/// akka     scala         1200  100.0%      0.0%          0
 /// ```
+///
+/// Scala is the only language ported here with NO parse-error floor: 400/400
+/// sampled files parse clean on cats and akka. Its 4.4% deferral on cats is
+/// entirely `non_ascii_id` -- that codebase leans on symbolic operators, and the
+/// id recipe's casefold+NFKC fixpoint is not reproduced in Rust.
 ///
 /// Lua is the cheapest language ported here and the number worth remembering is
 /// not its 99.8%: `engine.py` has ZERO `_is_lua` guards and zero
@@ -157,7 +164,7 @@ pub type Walker = for<'py> fn(
 pub fn supported() -> Vec<&'static str> {
     vec![
         "typescript", "tsx", "javascript", "python", "java", "csharp", "c", "cpp",
-        "php", "bash", "go", "rust", "ruby", "kotlin", "lua",
+        "php", "bash", "go", "rust", "ruby", "kotlin", "lua", "scala",
     ]
 }
 
@@ -190,6 +197,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
         // line in `supported` if the grammar improves; the walker is gated and
         // ready.
         "groovy" => Some(crate::groovy::walk_groovy),
+        "scala" => Some(crate::scala::walk_scala),
         _ => None,
     }
 }
@@ -215,7 +223,7 @@ pub fn walker_for(language: &str) -> Option<Walker> {
 /// The node-kind and field counts change with essentially any grammar revision,
 /// which is what makes the triple a usable proxy for "same grammar".
 pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
-    let langs: [(&'static str, tree_sitter::Language); 16] = [
+    let langs: [(&'static str, tree_sitter::Language); 17] = [
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ("javascript", tree_sitter_javascript::LANGUAGE.into()),
@@ -232,6 +240,7 @@ pub fn grammar_fingerprints() -> Vec<(&'static str, u32, u32, u32)> {
         ("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into()),
         ("lua", tree_sitter_lua::LANGUAGE.into()),
         ("groovy", tree_sitter_groovy::LANGUAGE.into()),
+        ("scala", tree_sitter_scala::LANGUAGE.into()),
     ];
     langs
         .iter()

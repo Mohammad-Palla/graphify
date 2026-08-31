@@ -68,6 +68,7 @@ _GRAMMAR_TO_LANGUAGE: dict[tuple[str, str], str] = {
     ("tree_sitter_kotlin", "language"): "kotlin",
     ("tree_sitter_lua", "language"): "lua",
     ("tree_sitter_groovy", "language"): "groovy",
+    ("tree_sitter_scala", "language"): "scala",
 }
 
 # The reverse map, for the grammar-version check below: kernel language key ->
